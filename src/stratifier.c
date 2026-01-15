@@ -4421,7 +4421,7 @@ static void reset_bestshares(sdata_t *sdata)
     sdata->stats.best_diff = sdata->stats.accounted_diff_shares = sdata->stats.accounted_rejects = 0;
     mutex_unlock(&sdata->stats_lock);
 
-    ck_rlock(&sdata->instance_lock);
+    ck_wlock(&sdata->instance_lock);
     HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
         client->best_diff = 0;
     }
@@ -4433,7 +4433,7 @@ static void reset_bestshares(sdata_t *sdata)
             worker->best_diff = worker->shares = 0;
         }
     }
-    ck_runlock(&sdata->instance_lock);
+    ck_wunlock(&sdata->instance_lock);
 }
 
 static user_instance_t *user_by_workername(sdata_t *sdata, const char *workername)
@@ -4531,6 +4531,28 @@ static void remap_workinfo_id(sdata_t *sdata, json_t *val, const int64_t client_
     json_set_int64(val, "workinfoid", mapped_id);
 }
 
+/* Note: this takes: sdata->workbase_lock & sdata->stats_lock; so must be entered with no locks held! */
+static void block_share_summary(sdata_t *sdata)
+{
+    double network_diff, effort_pct;
+    int64_t accounted_diff_shares;
+
+    ck_rlock(&sdata->workbase_lock);
+    network_diff = sdata && sdata->current_workbase ? sdata->current_workbase->network_diff : 0.0;
+    ck_runlock(&sdata->workbase_lock);
+
+    if (unlikely(network_diff <= 0.0))
+        return;
+
+    mutex_lock(&sdata->stats_lock);
+    accounted_diff_shares = sdata->stats.accounted_diff_shares;
+    mutex_unlock(&sdata->stats_lock);
+
+    effort_pct = (accounted_diff_shares / network_diff) * 100.0;
+
+    LOGWARNING("Block solved after %" PRId64 " shares at %.1f%% effort", accounted_diff_shares, effort_pct);
+}
+
 static void block_solve(pool_t *ckp, json_t *val)
 {
     char *msg, *workername = NULL;
@@ -4595,6 +4617,7 @@ static void block_solve(pool_t *ckp, json_t *val)
 
     free(workername);
 
+    block_share_summary(sdata);
     reset_bestshares(sdata);
 }
 
@@ -6340,10 +6363,6 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
         if (user->best_diff_alltime > stats->best_diff_alltime) {
             stats->best_diff_alltime = user->best_diff_alltime;
         }
-        // pool-wide bestshare was also added later, so ensure it's >= user bestshare
-        if (user->best_diff > stats->best_diff) {
-            stats->best_diff = user->best_diff;
-        }
         LOGDEBUG("Successfully read user %s stats %f %f %f %f %f %f %f %f %f", username,
                  user->dsps1, user->dsps5, user->dsps60, user->dsps1440,
                  user->dsps10080, user->best_diff, user->best_diff_alltime,
@@ -6388,10 +6407,6 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
             // pool-wide bestshare_alltime was also added later, so ensure it's >= worker bestshare_alltime
             if (worker->best_diff_alltime > stats->best_diff_alltime) {
                 stats->best_diff_alltime = worker->best_diff_alltime;
-            }
-            // pool-wide bestshare was also added later, so ensure it's >= worker bestshare
-            if (worker->best_diff > stats->best_diff) {
-                stats->best_diff = worker->best_diff;
             }
             LOGDEBUG("Successfully read worker %s stats %f %f %f %f %f %f %f %f",
                      worker->workername, worker->dsps1, worker->dsps5, worker->dsps60,
@@ -7151,6 +7166,18 @@ static void submit_share(stratum_instance_t *client, const int64_t jobid, const 
     generator_add_send(ckp, json_msg);
 }
 
+static void check_pool_best_diff(sdata_t *sdata, const double sdiff)
+{
+    mutex_lock(&sdata->stats_lock);
+    /* Don't set pool best diff if it's a block since we will have reset it to zero. */
+    if (sdiff > sdata->stats.best_diff && sdiff < sdata->current_workbase->network_diff) {
+        sdata->stats.best_diff = sdiff;
+        if (sdiff > sdata->stats.best_diff_alltime)
+            sdata->stats.best_diff_alltime = sdiff;
+    }
+    mutex_unlock(&sdata->stats_lock);
+}
+
 static void check_best_diff(pool_t *ckp, sdata_t *sdata, user_instance_t *user,
                             worker_instance_t *worker, const double sdiff, stratum_instance_t *client)
 {
@@ -7174,13 +7201,8 @@ static void check_best_diff(pool_t *ckp, sdata_t *sdata, user_instance_t *user,
         best_str = "user";
     }
     mutex_unlock(&user->stats_lock);
-    mutex_lock(&sdata->stats_lock);
-    if (sdiff > sdata->stats.best_diff) {
-        sdata->stats.best_diff = floor(sdiff);
-        if (sdata->stats.best_diff > sdata->stats.best_diff_alltime)
-            sdata->stats.best_diff_alltime = sdata->stats.best_diff;
-    }
-    mutex_unlock(&sdata->stats_lock);
+
+    check_pool_best_diff(sdata, sdiff);
 
     if (likely((!best_user && !best_worker) || !client))
         return;
@@ -7323,6 +7345,10 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
         LOGINFO("User %s worker %s client %s new best diff %lf", user->username,
                 worker->workername, client->identity, sdiff);
         check_best_diff(ckp, sdata, user, worker, sdiff, client);
+    } else {
+        /* Workaround to some race here where client->best_diff is sometimes stale, but we still want to properly update
+         * pool-wide best_diff */
+        check_pool_best_diff(sdata, sdiff);
     }
     bswap_256(sharehash, hash);
     bin2hex__(hexhash, sharehash, 32);
@@ -7337,8 +7363,7 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
             ts_to_tv(&now_tv, &now);
             latency = ms_tvdiff(&now_tv, &wb->retired);
             if (latency < client->latency) {
-                LOGDEBUG("Accepting %dms late share from client %s",
-                         latency, client->identity);
+                LOGDEBUG("Accepting %dms late share from client %s", latency, client->identity);
                 goto no_stale;
             }
         }
@@ -8381,8 +8406,10 @@ static void parse_remote_block(pool_t *ckp, sdata_t *sdata, json_t *val, const c
         /* We rely on the remote server to give us the ID_BLOCK
          * responses, so only use this response to determine if we
          * should reset the best shares. */
-        if (local_block_submit(ckp, gbt_block, gbt_block_len, flip32, wb->height))
+        if (local_block_submit(ckp, gbt_block, gbt_block_len, flip32, wb->height)) {
+            block_share_summary(sdata);
             reset_bestshares(sdata);
+        }
         put_remote_workbase(sdata, wb);
     }
 
@@ -9398,7 +9425,7 @@ static void *statsupdate(void *arg)
             ck_wlock(&sdata->instance_lock);
             /* Drop the reference of the last entry we examined,
              * then grab the next client. */
-           dec_instance_ref__(client);
+            dec_instance_ref__(client);
             client = client->hh.next;
             /* Grab a reference to this client allowing us to examine
              * it without holding the lock */
