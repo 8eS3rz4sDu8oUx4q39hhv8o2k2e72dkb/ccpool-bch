@@ -407,6 +407,14 @@ TEST_CASE(suffix_string) {
     TEST_CHECK_EQUAL(buf,  "-1.1K"sv);
 
     // Mega
+    suffix_string(1000 * 1e3, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1M"sv);
+    suffix_string(-1000 * 1e3, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1M"sv);
+    suffix_string(1001 * 1e3, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1M"sv);
+    suffix_string(-1001 * 1e3, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1M"sv);
     suffix_string(1100.1 * 1e3, buf, bufsz, 0);
     TEST_CHECK_EQUAL(buf,  "1.1M"sv);
     suffix_string(-1100.2 * 1e3, buf, bufsz, 0);
@@ -421,6 +429,14 @@ TEST_CASE(suffix_string) {
     TEST_CHECK_EQUAL(buf,  "-1.1002M"sv);
 
     // Giga
+    suffix_string(1000 * 1e6, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1G"sv);
+    suffix_string(-1000 * 1e6, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1G"sv);
+    suffix_string(1001 * 1e6, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1G"sv);
+    suffix_string(-1001 * 1e6, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1G"sv);
     suffix_string(1100.1 * 1e6, buf, bufsz, 0);
     TEST_CHECK_EQUAL(buf,  "1.1G"sv);
     suffix_string(-1100.2 * 1e6, buf, bufsz, 0);
@@ -435,6 +451,14 @@ TEST_CASE(suffix_string) {
     TEST_CHECK_EQUAL(buf,  "-1.1002G"sv);
 
     // Tera
+    suffix_string(1000 * 1e9, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1T"sv);
+    suffix_string(-1000 * 1e9, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1T"sv);
+    suffix_string(1001 * 1e9, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1T"sv);
+    suffix_string(-1001 * 1e9, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1T"sv);
     suffix_string(1100.1 * 1e9, buf, bufsz, 0);
     TEST_CHECK_EQUAL(buf,  "1.1T"sv);
     suffix_string(-1100.2 * 1e9, buf, bufsz, 0);
@@ -449,6 +473,14 @@ TEST_CASE(suffix_string) {
     TEST_CHECK_EQUAL(buf,  "-1.1002T"sv);
 
     // Peta
+    suffix_string(1000 * 1e12, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1P"sv);
+    suffix_string(-1000 * 1e12, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1P"sv);
+    suffix_string(1001 * 1e12, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1P"sv);
+    suffix_string(-1001 * 1e12, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1P"sv);
     suffix_string(1100.1 * 1e12, buf, bufsz, 0);
     TEST_CHECK_EQUAL(buf,  "1.1P"sv);
     suffix_string(-1100.2 * 1e12, buf, bufsz, 0);
@@ -463,6 +495,14 @@ TEST_CASE(suffix_string) {
     TEST_CHECK_EQUAL(buf,  "-1.1002P"sv);
 
     // Exa
+    suffix_string(1000 * 1e15, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1E"sv);
+    suffix_string(-1000 * 1e15, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1E"sv);
+    suffix_string(1001 * 1e15, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1E"sv);
+    suffix_string(-1001 * 1e15, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1E"sv);
     suffix_string(1100.1 * 1e15, buf, bufsz, 0);
     TEST_CHECK_EQUAL(buf,  "1.1E"sv);
     suffix_string(-1100.2 * 1e15, buf, bufsz, 0);
@@ -477,6 +517,14 @@ TEST_CASE(suffix_string) {
     TEST_CHECK_EQUAL(buf,  "-1.1002E"sv);
 
     // Beyond exa just is E always
+    suffix_string(1000 * 1e18, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1000E"sv);
+    suffix_string(-1000 * 1e18, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1000E"sv);
+    suffix_string(1001 * 1e18, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "1001E"sv);
+    suffix_string(-1001 * 1e18, buf, bufsz, 0);
+    TEST_CHECK_EQUAL(buf,  "-1001E"sv);
     suffix_string(1100.1 * 1e18, buf, bufsz, 0);
     TEST_CHECK_EQUAL(buf,  "1100.1E"sv);
     suffix_string(-1100.2 * 1e18, buf, bufsz, 0);
