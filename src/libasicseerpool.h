@@ -273,6 +273,7 @@ void logmsg(int loglevel, const char *fmt, ...);
 #define MIN5	300
 #define MIN15	900
 #define HOUR	3600
+#define HOUR4	14400
 #define HOUR6	21600
 #define DAY	86400
 #define WEEK	604800
