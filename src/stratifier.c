@@ -71,6 +71,7 @@ typedef struct generation generation_t;
 typedef struct user_instance user_instance_t;
 typedef struct worker_instance worker_instance_t;
 typedef struct stratum_instance stratum_instance_t;
+static void hashrate_to_str2(double val, char *buf, size_t bufsiz);
 
 struct generation {
     UT_hash_handle hh;
@@ -220,11 +221,16 @@ struct user_instance {
 
     int64_t shares;
 
+    /* Block round share counters (reset on every block solve) */
+    int64_t accepted; /* Sum of difficulties of accepted shares in current round */
+    int64_t rejected; /* Sum of difficulties of rejected shares in current round */
+
     int64_t uadiff; /* Shares not yet accounted for in hashmeter */
 
     double dsps1; /* Diff shares per second, 1 minute rolling average */
     double dsps5; /* ... 5 minute ... */
     double dsps60;/* etc */
+    double dsps240; /* 4 hour rolling average */
     double dsps1440;
     double dsps10080;
     tv_t last_share;
@@ -258,6 +264,7 @@ struct worker_instance {
     double dsps1;
     double dsps5;
     double dsps60;
+    double dsps240;
     double dsps1440;
     double dsps10080;
     tv_t last_share;
@@ -323,6 +330,7 @@ struct stratum_instance {
     double dsps1; /* Diff shares per second, 1 minute rolling average */
     double dsps5; /* ... 5 minute ... */
     double dsps60;/* etc */
+    double dsps240;
     double dsps1440;
     double dsps10080;
     tv_t ldc; /* Last diff change */
@@ -368,6 +376,10 @@ struct stratum_instance {
     int64_t suggest_diff; /* Stratum client suggested diff  - note this may also come from mindiff_overrides */
     double best_diff; /* Best share found by this instance (this is reset on block solve) */
     double best_diff_alltime; /* Best share found by this instance (persistent) */
+
+    /* Manual difficulty flags (per-session state) */
+    bool fixed_diff;    /* True if md= fixed diff set via password field; disables vardiff */
+    bool password_diff; /* True if d= or md= was set via password field; ignore useragent/suggest overrides */
 
     sdata_t *sdata; /* Which sdata this client is bound to */
     proxy_t *proxy; /* Proxy this is bound to in proxy mode */
@@ -1612,6 +1624,16 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
         // Network difficulty change, log it to normal log
         memcpy(sdata->lastBitsSeen, nbits, 4);
         LOGNOTICE("Network difficulty changed: %1.3f", wb->network_diff);
+
+        /* Network difficulty history entry */
+        char dstamp[128], dfile[512];
+        get_timestamp(dstamp, sizeof(dstamp), ckp->localtime_logging);
+        snprintf(dfile, sizeof(dfile) - 1, "%s/history/difficulty/network.difficulty", ckp->logdir);
+        FILE *fp_diff = fopen(dfile, "ae");
+        if (fp_diff) {
+            fprintf(fp_diff, "%s Network difficulty changed: %1.3f\n", dstamp, wb->network_diff);
+            fclose(fp_diff);
+        }
     }
     if (strncmp(wb->prevhash, sdata->lasthash, 64)) {
         *new_block = true;
@@ -2032,65 +2054,181 @@ static void confirm_block(sdata_t *sdata, json_t *blocksolve_val)
 
 }
 
-/* Block was orphaned, re-add shares removed when resetting shares on blocksolve
- * for diff calculation to be correct on next block solve. */
+/* Block was orphaned. In Variant C we do NOT re-add old shares to the pool round
+ * counter. Both pool and user stay on a clean slate for the current round,
+ * preserving clean statistics for block history tables. */
 static void orphan_block(sdata_t *sdata, json_t *val)
 {
-    int64_t shares;
+    int height = 0;
+    int64_t shares = 0;
 
+    json_get_int(&height, val, "height");
     json_get_int64(&shares, val, "shares");
 
-    mutex_lock(&sdata->stats_lock);
-    sdata->stats.accounted_diff_shares += shares;
-    mutex_unlock(&sdata->stats_lock);
+    LOGWARNING("Block %d orphaned (had %"PRId64" shares). Starting next block with clean slate.",
+               height, shares);
 }
 
-/* Find the first unconfirmed block that is 2 confirms ago and remove it
- * from the list, declaring it confirmed or orphaned. */
+/* Find all unconfirmed blocks that are >= 2 confirms ago, verify against
+ * the canonical chain, and declare them confirmed or orphaned. */
 static void check_unconfirmed(pool_t *ckp, sdata_t *sdata, const int height)
 {
     char heighthash[68] = {0}, *rhash, *fname, *newname;
-    json_entry_t *blocksolve, *found = NULL;
     pool_stats_t *stats = &sdata->stats;
-    int solveheight = 0;
-    bool ret;
 
-    mutex_lock(&sdata->stats_lock);
-    /* No need to use foreach_safe since we abort when we delete a solve */
-    DL_FOREACH(stats->unconfirmed, blocksolve) {
-        json_t *val = blocksolve->val;
+    while (42) {
+        json_entry_t *blocksolve, *found = NULL;
+        int solveheight = 0;
+        bool ret;
 
-        json_get_int(&solveheight, val, "height");
-        if (height - solveheight < 2)
-            continue;
-        DL_DELETE(stats->unconfirmed, blocksolve);
-        found = blocksolve;
-        break;
+        mutex_lock(&sdata->stats_lock);
+        DL_FOREACH(stats->unconfirmed, blocksolve) {
+            json_t *val = blocksolve->val;
+
+            json_get_int(&solveheight, val, "height");
+            if (height - solveheight < 2)
+                continue;
+            DL_DELETE(stats->unconfirmed, blocksolve);
+            found = blocksolve;
+            break;
+        }
+        mutex_unlock(&sdata->stats_lock);
+
+        /* No more mature unconfirmed blocks to process */
+        if (!found)
+            break;
+
+        /* Query node for canonical block hash at this height */
+        memset(heighthash, 0, sizeof(heighthash));
+        if (!generator_get_blockhash(ckp, solveheight, heighthash)) {
+            LOGWARNING("Node failed to provide block hash for height %d (node syncing?), deferring check",
+                       solveheight);
+            /* Return back to the queue and try again later */
+            mutex_lock(&sdata->stats_lock);
+            DL_PREPEND(stats->unconfirmed, found);
+            mutex_unlock(&sdata->stats_lock);
+            break;
+        }
+
+        json_get_string(&rhash, found->val, "hash");
+        ret = !strncmp(rhash, heighthash, 64);
+        dealloc(rhash);
+
+        if (ret)
+            confirm_block(sdata, found->val);
+        else
+            orphan_block(sdata, found->val);
+
+        LOGWARNING("Hash for block height %d confirms block was %s", solveheight,
+                   ret ? "CONFIRMED" : "ORPHANED");
+
+        /* Update internal JSON status */
+        json_set_string(found->val, "status", ret ? "CONFIRMED" : "ORPHANED");
+
+        ASPRINTF(&fname, "%s/pool/blocks/%d.unconfirmed", ckp->logdir, solveheight);
+        ASPRINTF(&newname, "%s/pool/blocks/%d.%s", ckp->logdir, solveheight, ret ?
+            "confirmed" : "orphaned");
+
+        /* Atomically rewrite JSON to new file and remove obsolete .unconfirmed */
+        FILE *fp = fopen(newname, "we");
+        if (likely(fp)) {
+            char *s = json_dumps(found->val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
+                                             JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
+            fprintf(fp, "%s", s);
+            free(s);
+            fclose(fp);
+            unlink(fname);
+        } else {
+            rename(fname, newname);
+        }
+
+        dealloc(fname);
+        dealloc(newname);
+        json_decref(found->val);
+        dealloc(found);
     }
-    mutex_unlock(&sdata->stats_lock);
+}
 
-    if (likely(!found))
+/* Scan logs/pool/blocks and restore any left-over .unconfirmed blocks
+ * into the in-memory queue (with duplicate protection). */
+static void read_unconfirmed_blocks(pool_t *ckp, sdata_t *sdata)
+{
+    char dnam[512], s[512 + 64];
+    struct dirent *dir;
+    int count = 0;
+    DIR *d;
+
+    snprintf(dnam, sizeof(dnam) - 1, "%s/pool/blocks", ckp->logdir);
+    d = opendir(dnam);
+    if (!d)
         return;
 
-    json_get_string(&rhash, found->val, "hash");
-    generator_get_blockhash(ckp, solveheight, heighthash);
-    ret = !strncmp(rhash, heighthash, 64);
-    dealloc(rhash);
-    if (ret)
-        confirm_block(sdata, found->val);
-    else
-        orphan_block(sdata, found->val);
+    while ((dir = readdir(d)) != NULL) {
+        const char *dot = strrchr(dir->d_name, '.');
+        if (!dot || strcmp(dot, ".unconfirmed"))
+            continue;
 
-    LOGWARNING("Hash for block height %d confirms block was %s", solveheight,
-           ret ? "CONFIRMED" : "ORPHANED");
-    ASPRINTF(&fname, "%s/pool/blocks/%d.unconfirmed", ckp->logdir, solveheight);
-    ASPRINTF(&newname, "%s/pool/blocks/%d.%s", ckp->logdir, solveheight, ret ?
-        "confirmed" : "orphaned");
-    rename(fname, newname);
-    dealloc(fname);
-    dealloc(newname);
-    json_decref(found->val);
-    dealloc(found);
+        int file_height = atoi(dir->d_name);
+        if (file_height <= 0)
+            continue;
+
+        /* Check if this height is ALREADY in the in-memory queue to prevent duplicates */
+        bool already_queued = false;
+        mutex_lock(&sdata->stats_lock);
+        json_entry_t *entry;
+        DL_FOREACH(sdata->stats.unconfirmed, entry) {
+            int q_height = 0;
+            json_get_int(&q_height, entry->val, "height");
+            if (q_height == file_height) {
+                already_queued = true;
+                break;
+            }
+        }
+        mutex_unlock(&sdata->stats_lock);
+
+        if (already_queued)
+            continue;
+
+        snprintf(s, sizeof(s), "%s/%s", dnam, dir->d_name);
+        FILE *fp = fopen(s, "re");
+        if (!fp)
+            continue;
+
+        struct stat fdbuf;
+        if (fstat(fileno(fp), &fdbuf) || fdbuf.st_size <= 0) {
+            fclose(fp);
+            continue;
+        }
+
+        char *buf = ckzalloc(fdbuf.st_size + 1);
+        size_t ret = fread(buf, 1, fdbuf.st_size, fp);
+        fclose(fp);
+
+        if (ret < 1) {
+            free(buf);
+            continue;
+        }
+
+        json_t *val = json_loads(buf, 0, NULL);
+        free(buf);
+
+        if (!val) {
+            LOGWARNING("Failed to parse JSON in unconfirmed block file: %s", s);
+            continue;
+        }
+
+        json_entry_t *blocksolve = ckzalloc(sizeof(json_entry_t));
+        blocksolve->val = val;
+
+        mutex_lock(&sdata->stats_lock);
+        DL_APPEND(sdata->stats.unconfirmed, blocksolve);
+        mutex_unlock(&sdata->stats_lock);
+        count++;
+    }
+    closedir(d);
+
+    if (count)
+        LOGWARNING("Restored %d unconfirmed block(s) from disk for confirmation check", count);
 }
 
 static time_t sdata_get_update_time_safe(sdata_t *sdata, time_t *last_newblock_time)
@@ -4428,7 +4566,13 @@ static void reset_bestshares(sdata_t *sdata)
     HASH_ITER(hh, sdata->user_instances, user, tmpuser) {
         worker_instance_t *worker;
 
+        /* Reset round shares for this user */
+        mutex_lock(&user->stats_lock);
+        user->accepted = 0;
+        user->rejected = 0;
         user->best_diff = 0;
+        mutex_unlock(&user->stats_lock);
+
         DL_FOREACH(user->worker_instances, worker) {
             worker->best_diff = 0;
         }
@@ -4453,29 +4597,33 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 
 static json_t *worker_stats(const worker_instance_t *worker)
 {
-    char suffix1[16], suffix5[16], suffix60[16], suffix1440[16], suffix10080[16];
+    char suffix1[16], suffix5[16], suffix60[16], suffix240[16], suffix1440[16], suffix10080[16];
     json_t *val;
     double ghs;
 
     ghs = worker->dsps1 * nonces;
-    suffix_string(ghs, suffix1, 16, 0);
+    hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
 
     ghs = worker->dsps5 * nonces;
-    suffix_string(ghs, suffix5, 16, 0);
+    hashrate_to_str2(ghs, suffix5, sizeof(suffix5));
 
     ghs = worker->dsps60 * nonces;
-    suffix_string(ghs, suffix60, 16, 0);
+    hashrate_to_str2(ghs, suffix60, sizeof(suffix60));
+
+    ghs = worker->dsps240 * nonces;
+    hashrate_to_str2(ghs, suffix240, sizeof(suffix240));
 
     ghs = worker->dsps1440 * nonces;
-    suffix_string(ghs, suffix1440, 16, 0);
+    hashrate_to_str2(ghs, suffix1440, sizeof(suffix1440));
 
     ghs = worker->dsps10080 * nonces;
-    suffix_string(ghs, suffix10080, 16, 0);
+    hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
-    JSON_CPACK(val, "{ss,ss,ss,ss,ss}",
+    JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss}",
             "hashrate1m", suffix1,
             "hashrate5m", suffix5,
             "hashrate1hr", suffix60,
+            "hashrate4hr", suffix240,
             "hashrate1d", suffix1440,
             "hashrate7d", suffix10080);
     return val;
@@ -4483,29 +4631,33 @@ static json_t *worker_stats(const worker_instance_t *worker)
 
 static json_t *user_stats(const user_instance_t *user)
 {
-    char suffix1[16], suffix5[16], suffix60[16], suffix1440[16], suffix10080[16];
+    char suffix1[16], suffix5[16], suffix60[16], suffix240[16], suffix1440[16], suffix10080[16];
     json_t *val;
     double ghs;
 
     ghs = user->dsps1 * nonces;
-    suffix_string(ghs, suffix1, 16, 0);
-
+    hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
+    
     ghs = user->dsps5 * nonces;
-    suffix_string(ghs, suffix5, 16, 0);
-
+    hashrate_to_str2(ghs, suffix5, sizeof(suffix5));
+    
     ghs = user->dsps60 * nonces;
-    suffix_string(ghs, suffix60, 16, 0);
+    hashrate_to_str2(ghs, suffix60, sizeof(suffix60));
 
+    ghs = user->dsps240 * nonces;
+    hashrate_to_str2(ghs, suffix240, sizeof(suffix240));
+    
     ghs = user->dsps1440 * nonces;
-    suffix_string(ghs, suffix1440, 16, 0);
-
+    hashrate_to_str2(ghs, suffix1440, sizeof(suffix1440));
+    
     ghs = user->dsps10080 * nonces;
-    suffix_string(ghs, suffix10080, 16, 0);
+    hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
-    JSON_CPACK(val, "{ss,ss,ss,ss,ss}",
+    JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss}",
             "hashrate1m", suffix1,
             "hashrate5m", suffix5,
             "hashrate1hr", suffix60,
+            "hashrate4hr", suffix240,
             "hashrate1d", suffix1440,
             "hashrate7d", suffix10080);
     return val;
@@ -4550,7 +4702,7 @@ static void block_share_summary(sdata_t *sdata)
 
     effort_pct = (accounted_diff_shares / network_diff) * 100.0;
 
-    LOGWARNING("Block solved after %" PRId64 " shares at %.1f%% effort", accounted_diff_shares, effort_pct);
+    LOGWARNING("Block solved after %" PRId64 " shares at %.2f%% effort", accounted_diff_shares, effort_pct);
 }
 
 static void block_solve(pool_t *ckp, json_t *val)
@@ -6104,14 +6256,41 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
     if (strcasestr(client->useragent, "gminer"))
         client->messages = true;
 
+    /* Check for rental services in useragent only on mainnet */
+    if (!ckp->not_mainnet) {
+        if (strcasestr(client->useragent, "nicehash")) {
+            int64_t nicehash_diff = 500000; /* Default NiceHash minimum */
+            if (ckp->mindiff && nicehash_diff < ckp->mindiff)
+                nicehash_diff = ckp->mindiff;
+            if (ckp->maxdiff && nicehash_diff > ckp->maxdiff)
+                nicehash_diff = ckp->maxdiff;
+            client->suggest_diff = client->diff = client->old_diff = nicehash_diff;
+            LOGNOTICE("NiceHash detected from useragent '%s' for client %"PRId64", applied difficulty %"PRId64,
+                      client->useragent, client_id, nicehash_diff);
+        } else if (strcasestr(client->useragent, "miningrigrentals")) {
+            int64_t mrr_diff = 1000000; /* Default MRR minimum */
+            if (ckp->mindiff && mrr_diff < ckp->mindiff)
+                mrr_diff = ckp->mindiff;
+            if (ckp->maxdiff && mrr_diff > ckp->maxdiff)
+                mrr_diff = ckp->maxdiff;
+            client->suggest_diff = client->diff = client->old_diff = mrr_diff;
+            LOGNOTICE("MiningRigRentals detected from useragent '%s' for client %"PRId64", applied difficulty %"PRId64,
+                      client->useragent, client_id, mrr_diff);
+        } else {
+            client_apply_mindiff_override(client);
+        }
+    } else {
+        client_apply_mindiff_override(client);
+    }
+
     /* We got what we needed */
     if (ckp->node)
         return NULL;
 
     if (ckp->proxy) {
         /* Use the session_id to tell us which user this was.
-            * If it's not available, see if there's an IP address
-            * which matches a recently disconnected session. */
+         * If it's not available, see if there's an IP address
+         * which matches a recently disconnected session. */
         if (session_id)
             userid = userid_from_sessionid(ckp_sdata, session_id);
         if (userid == -1)
@@ -6151,14 +6330,6 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
     JSON_CPACK(ret, "[[[s,s]],s,i]", "mining.notify", sessionid, client->enonce1,
             n2len);
     ck_runlock(&sdata->workbase_lock);
-
-    // Apply any mindiff_overrides from config here.
-    // This sets client->suggest_diff, and initial client->diff, if any overrides match for this client
-    // (based on useragent).
-    // Known issue here: It's assumed the client sends mining.subscribe after initial connect.
-    // This call here won't spam a new difficulty change notification message, since the normal
-    // call path will send the initial difficulty message in init_client() later anyway. -Calin
-    client_apply_mindiff_override(client);
 
     client->subscribed = true;
 
@@ -6214,6 +6385,7 @@ static void decay_client(stratum_instance_t *client, double diff, tv_t *now_t)
     decay_time(&client->dsps1, diff, tdiff, MIN1);
     decay_time(&client->dsps5, diff, tdiff, MIN5);
     decay_time(&client->dsps60, diff, tdiff, HOUR);
+    decay_time(&client->dsps240, diff, tdiff, HOUR4);
     decay_time(&client->dsps1440, diff, tdiff, DAY);
     decay_time(&client->dsps10080, diff, tdiff, WEEK);
 }
@@ -6232,6 +6404,7 @@ static void decay_worker(worker_instance_t *worker, double diff, tv_t *now_t)
     decay_time(&worker->dsps1, diff, tdiff, MIN1);
     decay_time(&worker->dsps5, diff, tdiff, MIN5);
     decay_time(&worker->dsps60, diff, tdiff, HOUR);
+    decay_time(&worker->dsps240, diff, tdiff, HOUR4);
     decay_time(&worker->dsps1440, diff, tdiff, DAY);
     decay_time(&worker->dsps10080, diff, tdiff, WEEK);
 }
@@ -6250,6 +6423,7 @@ static void decay_user(user_instance_t *user, double diff, tv_t *now_t)
     decay_time(&user->dsps1, diff, tdiff, MIN1);
     decay_time(&user->dsps5, diff, tdiff, MIN5);
     decay_time(&user->dsps60, diff, tdiff, HOUR);
+    decay_time(&user->dsps240, diff, tdiff, HOUR4);
     decay_time(&user->dsps1440, diff, tdiff, DAY);
     decay_time(&user->dsps10080, diff, tdiff, WEEK);
 }
@@ -6343,11 +6517,14 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
         user->dsps1 = dsps_from_key(val, "hashrate1m");
         user->dsps5 = dsps_from_key(val, "hashrate5m");
         user->dsps60 = dsps_from_key(val, "hashrate1hr");
+        user->dsps240 = dsps_from_key(val, "hashrate4hr");
         user->dsps1440 = dsps_from_key(val, "hashrate1d");
         user->dsps10080 = dsps_from_key(val, "hashrate7d");
         json_get_int(&lastshare, val, "lastshare");
         user->last_share.tv_sec = lastshare;
         json_get_int64(&user->shares, val, "shares");
+        json_get_int64(&user->accepted, val, "accepted");
+        json_get_int64(&user->rejected, val, "rejected");
         json_get_double(&user->best_diff, val, "bestshare");
         json_get_double(&user->best_diff_alltime, val, "bestshare_alltime");
         json_get_double(&user->accumulated, val, "accumulated");
@@ -6391,6 +6568,7 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
             worker->dsps1 = dsps_from_key(arr_val, "hashrate1m");
             worker->dsps5 = dsps_from_key(arr_val, "hashrate5m");
             worker->dsps60 = dsps_from_key(arr_val, "hashrate1hr");
+            worker->dsps240 = dsps_from_key(arr_val, "hashrate4hr");
             worker->dsps1440 = dsps_from_key(arr_val, "hashrate1d");
             worker->dsps10080 = dsps_from_key(arr_val, "hashrate7d");
             json_get_int(&lastshare, arr_val, "lastshare");
@@ -6634,13 +6812,51 @@ static void client_auth(pool_t *ckp, stratum_instance_t *client, user_instance_t
 }
 
 static json_t *user_solo_notify__(const workbase_t *wb, const user_instance_t *user, const bool clean);
-
 static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t client_id, user_instance_t *user_instance)
 {
     json_t *json_msg = user_solo_notify__(wb, user_instance, true);
-
     stratum_add_send(sdata, json_msg, client_id, SM_UPDATE);
 }
+
+/* Password diff setting starts here */
+/*
+ * Parse the stratum password field for difficulty directives, supporting
+ * both local miners (e.g. NerdQAxe++) and rented-rig / marketplace clients
+ * (miningrigrentals.com, NiceHash, etc) that pass extra parameters in the
+ * password. Tokens are comma, semicolon or space separated, e.g.:
+ *   "d=25000"            -> mindiff + startdiff, vardiff continues to run
+ *   "md=300000"          -> fixed diff, vardiff engine disabled
+ *   "d=0.5"              -> fractional diffs supported and rounded
+ *   "x,d=25000"          -> ignores unrelated tokens, still picks up d=
+ * Matching is case-insensitive. Invalid or missing values are ignored,
+ * leaving pool defaults untouched. If both d= and md= are present, md=
+ * (fixed) takes precedence.
+ */
+static void parse_password_diff(const char *pass, int64_t *req_mindiff, int64_t *req_fixeddiff)
+{
+    char *tokstr, *token, *saveptr = NULL;
+    if (!pass || !*pass)
+        return;
+    tokstr = strdupa(pass);
+    token = strtok_r(tokstr, ",; \t", &saveptr);
+    while (token) {
+        while (*token == ' ' || *token == '\t')
+            token++;
+        if (!strncasecmp(token, "md=", 3)) {
+            char *endptr = NULL;
+            double val = strtod(token + 3, &endptr);
+            if (val > 0.0)
+                *req_fixeddiff = (int64_t)MAX(1LL, llround(val));
+        } else if (!strncasecmp(token, "d=", 2)) {
+            char *endptr = NULL;
+            double val = strtod(token + 2, &endptr);
+            if (val > 0.0)
+                *req_mindiff = (int64_t)MAX(1LL, llround(val));
+        }
+        token = strtok_r(NULL, ",; \t", &saveptr);
+    }
+}
+/* Password diff setting ends here */
 
 /* Needs to be entered with client holding a ref count. */
 static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_val, json_t **err_val)
@@ -6700,6 +6916,49 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
         client->password = strndup(pass, 64);
     else
         client->password = strdup("");
+
+    /* Password-based difficulty (d=/md=) strictly bound to this stratum_instance session */
+    {
+        int64_t req_mindiff = 0, req_fixeddiff = 0;
+        parse_password_diff(client->password, &req_mindiff, &req_fixeddiff);
+
+        /* Absolute minimum diff to prevent Share Flooding DoS attacks */
+        const int64_t min_allowed = MAX(1, ckp->mindiff);
+
+        if (req_fixeddiff > 0) {
+            if (req_fixeddiff < min_allowed)
+                req_fixeddiff = min_allowed;
+            if (ckp->maxdiff && req_fixeddiff > ckp->maxdiff)
+                req_fixeddiff = ckp->maxdiff;
+
+            client->fixed_diff = true;
+            client->password_diff = true;
+            client->suggest_diff = 0; /* Clear suggest_diff to prevent vardiff retargeting */
+            client->diff_change_job_id = client->sdata->workbase_id + 1;
+            client->old_diff = client->diff;
+            client->diff = req_fixeddiff;
+            LOGNOTICE("Client %"PRId64" worker %s set fixed diff %"PRId64" from password field",
+                      client->id, buf, req_fixeddiff);
+        } else if (req_mindiff > 0) {
+            if (req_mindiff < min_allowed)
+                req_mindiff = min_allowed;
+            if (ckp->maxdiff && req_mindiff > ckp->maxdiff)
+                req_mindiff = ckp->maxdiff;
+
+            client->fixed_diff = false;
+            client->password_diff = true;
+            client->suggest_diff = req_mindiff; /* Sync with vardiff engine lower clamp */
+            client->diff_change_job_id = client->sdata->workbase_id + 1;
+            client->old_diff = client->diff;
+            client->diff = req_mindiff;
+            LOGNOTICE("Client %"PRId64" worker %s set mindiff/startdiff %"PRId64" from password field",
+                      client->id, buf, req_mindiff);
+        } else {
+            client->fixed_diff = false;
+            client->password_diff = false;
+        }
+    }
+
     if (user->failed_authtime) {
         time_t now_t = time(NULL);
 
@@ -6736,7 +6995,6 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
         client_auth(ckp, client, user, ret);
 out:
     if (ret && ckp->solo && !client->remote) {
-        sdata_t *sdata = ckp->sdata;
         workbase_t *wb;
 
         /* To avoid grabbing recursive lock */
@@ -6756,7 +7014,9 @@ out:
             wb->readcount--;
             ck_wunlock(&sdata->workbase_lock);
 
-            client_apply_mindiff_override(client); /* ensure diff respects mindiff_overrides */
+            /* Do not overwrite explicit password difficulty with useragent mindiff_overrides */
+            if (!client->password_diff)
+                client_apply_mindiff_override(client);
             stratum_send_diff(sdata, client);
         }
     }
@@ -6842,9 +7102,15 @@ static void add_submit(pool_t *ckp, stratum_instance_t *client, double sdiff,
         user->ua_lns += diff;
         worker->shares += diff;
         user->shares += diff;
+        user->accepted += (int64_t)diff;
         mutex_unlock(&user->stats_lock);
-    } else if (!submit)
-        return;
+    } else {
+        mutex_lock(&user->stats_lock);
+        user->rejected += (int64_t)diff;
+        mutex_unlock(&user->stats_lock);
+        if (!submit)
+            return;
+    }
 
     tv_time(&now_t);
 
@@ -6869,25 +7135,22 @@ static void add_submit(pool_t *ckp, stratum_instance_t *client, double sdiff,
     if (ckp->node)
         return;
 
+    /* If fixed difficulty was set via password (md=), disable vardiff engine */
+    if (unlikely(client->fixed_diff))
+        return;
+
     client->ssdc++;
     bdiff = sane_tdiff(&now_t, &client->first_share);
     bias = time_bias(bdiff, 300);
     tdiff = sane_tdiff(&now_t, &client->ldc);
 
-#if 0 // Original ck code
-    /* Check the difficulty every 240 seconds or as many shares as we
-     * should have had in that time, whichever comes first. */
-    if (client->ssdc < 72 && tdiff < 240)
-        return;
-#else
     /* Check the difficulty every 30 seconds or as many shares as we
      * should have had in that time, whichever comes first. */
     static const double targetSpacing = 3.33333;
     static const double checkEvery = 30;
-    const int nExpected = round(checkEvery/targetSpacing);
+    const int nExpected = round(checkEvery / targetSpacing);
     if (client->ssdc < nExpected && tdiff < checkEvery)
         return;
-#endif
 
     if (((int64_t)round(diff)) != client->diff) {
         client->ssdc = 0;
@@ -6907,6 +7170,7 @@ static void add_submit(pool_t *ckp, stratum_instance_t *client, double sdiff,
         mindiff = client->suggest_diff;
     else
         mindiff = worker->mindiff;
+
     /* Allow slightly lower diffs when users choose their own mindiff */
     if (mindiff) {
         if (drr < 0.5)
@@ -6997,6 +7261,11 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
     ts_realtime(&ts_now);
     sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
 
+    /* Capture precise timestamps of winning share reception BEFORE submitting to node */
+    char share_stamp[128], share_stamp_local[128];
+    get_timestamp(share_stamp, sizeof(share_stamp), false /* UTC */);
+    get_timestamp(share_stamp_local, sizeof(share_stamp_local), true /* Localtime */);
+
     gbt_block = process_block(wb, coinbase, cblen, data, hash, flip32, blockhash, &gbt_block_len);
     send_node_block(ckp, sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
             wb->id, diff, client->id, coinbase, cblen, data);
@@ -7034,9 +7303,16 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         ckdbq_add(ckp, ID_BLOCK, val);
     }
 
+    /* We detect the exact start time of sending to the node */
+    const int64_t t_submit_start = time_micros();
+
     /* Submit block locally after sending it to remote locations avoiding
      * the delay of local verification */
     ret = local_block_submit(ckp, gbt_block, gbt_block_len, flip32, wb->height);
+
+    /* Calculate the latence in ms. */
+    const int64_t node_latency_ms = (time_micros() - t_submit_start) / 1000;
+
     if (ret) {
         json_entry_t *blocksolve = ckzalloc(sizeof(json_entry_t));
         char *fname, stamp[128], *s, rhash[68] = {0};
@@ -7049,8 +7325,6 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         blockval = json_deep_copy(wb->payout);
         json_set_string(blockval, "solvedby", client->workername ? client->workername : client->user_instance->username);
         if (ckp->solo) {
-            // rewrite the payouts -> <solominer> entry to the correct username
-            // (this is read back later to do per-user stats accounting properly)
             json_t *payouts = json_object_get(blockval, "payouts");
             if (payouts) {
                 double val;
@@ -7061,10 +7335,20 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
                 }
             }
         }
+
+        /* 1. Timestamps of share arrival */
+        json_set_string(blockval, "share_date", share_stamp);
+        json_set_string(blockval, "share_date_localtime", share_stamp_local);
+
+        /* 2. Timestamps of node block acceptance */
         get_timestamp(stamp, sizeof(stamp), false /* date is always UTC */);
         json_set_string(blockval, "date", stamp);
         get_timestamp(stamp, sizeof(stamp), true /* date_localtime is always localtime */);
         json_set_string(blockval, "date_localtime", stamp);
+
+        /* 3. Local node latency in milliseconds */
+        json_set_int64(blockval, "node_latency_ms", (json_int_t)node_latency_ms);
+
         swap_256(swap256, flip32);
         bin2hex__(rhash, swap256, 32);
         json_set_string(blockval, "hash", rhash);
@@ -7072,15 +7356,22 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         mutex_lock(&sdata->stats_lock);
         shares = sdata->stats.accounted_diff_shares;
         json_set_int64(blockval, "shares", shares);
-        percent = round(shares * 1000 / wb->network_diff) / 10;
-        json_set_double(blockval, "diff", percent);
+        /* Effort formatted to 2 decimal places */
+        percent = round((double)shares * 10000.0 / wb->network_diff) / 100.0;
+        char block_diff_str[32];
+        snprintf(block_diff_str, sizeof(block_diff_str), "%.2f", percent);
+        json_set_string(blockval, "diff", block_diff_str);
         json_set_double(blockval, "network_difficulty", sdata->current_workbase->network_diff);
         json_set_double(blockval, "solution_difficulty", diff);
+
+        /* 4. Block status placed after solution_difficulty */
+        json_set_string(blockval, "status", "UNCONFIRMED");
+
         blocksolve->val = json_copy(blockval);
         DL_APPEND(sdata->stats.unconfirmed, blocksolve);
         mutex_unlock(&sdata->stats_lock);
 
-        /* Log to disk unlocked  with a dup of the json */
+        /* Log to disk unlocked with a dup of the json */
         ASPRINTF(&fname, "%s/pool/blocks/%d.unconfirmed", ckp->logdir, wb->height);
         fp = fopen(fname, "we");
         if (unlikely(!fp)) {
@@ -7095,8 +7386,62 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         json_decref(blockval);
         dealloc(fname);
         block_solve(ckp, val_copy);
-    } else
+    } else {
+        /* Record rejected block to disk so it is not lost */
+        char *fname, stamp[128], *s, rhash[68] = {0};
+        uchar swap256[32];
+        json_t *blockval;
+        int64_t shares;
+        double percent;
+        FILE *fp;
+
+        blockval = json_deep_copy(wb->payout);
+        json_set_string(blockval, "solvedby", client->workername ? client->workername : client->user_instance->username);
+
+        json_set_string(blockval, "share_date", share_stamp);
+        json_set_string(blockval, "share_date_localtime", share_stamp_local);
+
+        get_timestamp(stamp, sizeof(stamp), false);
+        json_set_string(blockval, "date", stamp);
+        get_timestamp(stamp, sizeof(stamp), true);
+        json_set_string(blockval, "date_localtime", stamp);
+
+        /* Node delay before deviation in milliseconds */
+        json_set_int64(blockval, "node_latency_ms", (json_int_t)node_latency_ms);
+
+        swap_256(swap256, flip32);
+        bin2hex__(rhash, swap256, 32);
+        json_set_string(blockval, "hash", rhash);
+
+        mutex_lock(&sdata->stats_lock);
+        shares = sdata->stats.accounted_diff_shares;
+        mutex_unlock(&sdata->stats_lock);
+
+        json_set_int64(blockval, "shares", shares);
+        percent = round((double)shares * 10000.0 / wb->network_diff) / 100.0;
+        char block_diff_str[32];
+        snprintf(block_diff_str, sizeof(block_diff_str), "%.2f", percent);
+        json_set_string(blockval, "diff", block_diff_str);
+        json_set_double(blockval, "network_difficulty", sdata->current_workbase->network_diff);
+        json_set_double(blockval, "solution_difficulty", diff);
+
+        /* Set status to REJECTED */
+        json_set_string(blockval, "status", "REJECTED");
+
+        ASPRINTF(&fname, "%s/pool/blocks/%d.rejected", ckp->logdir, wb->height);
+        fp = fopen(fname, "we");
+        if (likely(fp)) {
+            s = json_dumps(blockval, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
+                                     JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
+            fprintf(fp, "%s", s);
+            free(s);
+            fclose(fp);
+        }
+        json_decref(blockval);
+        dealloc(fname);
+
         block_reject(val_copy);
+    }
 
     return ret;
 }
@@ -7679,6 +8024,12 @@ static void suggest_diff(pool_t *ckp, stratum_instance_t *client, const char *me
 
     if (unlikely(!client_active(client))) {
         LOGNOTICE("Attempted to suggest diff on unauthorized client %s", client->identity);
+        return;
+    }
+    /* Password diff setting: ignore client suggestion if explicitly set via password */
+    if (unlikely(client->password_diff)) {
+        LOGINFO("Ignoring suggest_difficulty from client %s, diff set explicitly via password field",
+                client->identity);
         return;
     }
     if (arr_val && json_is_integer(arr_val))
@@ -8937,7 +9288,7 @@ static void sauth_process(pool_t *ckp, json_params_t *jp)
     json_t *result_val, *err_val = NULL;
     sdata_t *sdata = ckp->sdata;
     stratum_instance_t *client;
-    int64_t mindiff, client_id;
+    int64_t client_id;
     bool ret;
 
     client_id = jp->client_id;
@@ -8972,25 +9323,18 @@ static void sauth_process(pool_t *ckp, json_params_t *jp)
         goto out;
     }
 
-    /* Update the client now if they have set a valid mindiff different
-     * from the startdiff. suggest_diff overrides worker mindiff */
-    if (client->suggest_diff)
-        mindiff = client->suggest_diff;
-    else
-        mindiff = client->worker_instance->mindiff;
-    if (mindiff) {
-        mindiff = MAX(ckp->mindiff, mindiff);
-        if (mindiff != client->diff) {
-            client->diff = mindiff;
-            stratum_send_diff(sdata, client);
-        }
+    /* Send difficulty notification only if diff actually changed from what was sent upon subscribe.
+     * In SOLO mode, this was already handled in parse_authorize(). */
+    if (!client->ckp->solo && client->diff != client->old_diff) {
+        stratum_send_diff(sdata, client);
+        LOGINFO("Sent updated difficulty %"PRId64" to client %s after authorization",
+                client->diff, client->identity);
     }
 
 out:
     dec_instance_ref(sdata, client);
 out_noclient:
     discard_json_params(jp);
-
 }
 
 static int transactions_by_jobid(sdata_t *sdata, const int64_t id)
@@ -9305,6 +9649,525 @@ static void calc_user_paygens(sdata_t *sdata)
     mutex_unlock(&sdata->stats_lock);
 }
 
+/* Auxiliary functions for analytics, history, and node connectivity */
+
+/* Creating the necessary directories for history */
+static void ensure_history_dirs(const char *logdir)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/history", logdir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/history/users", logdir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/history/difficulty", logdir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/history/hashrate", logdir);
+    mkdir(path, 0755);
+}
+
+/* Formatting seconds into a dynamic string: 00d 00h 00m 00s */
+static void format_timetoblock(uint64_t seconds, char *buf, size_t buflen)
+{
+    if (seconds == 0) {
+        snprintf(buf, buflen, "0s");
+        return;
+    }
+    uint64_t d = seconds / 86400;
+    uint64_t rem = seconds % 86400;
+    uint64_t h = rem / 3600;
+    rem = rem % 3600;
+    uint64_t m = rem / 60;
+    uint64_t s = rem % 60;
+
+    char parts[64] = "";
+    int pos = 0;
+    if (d > 0)
+        pos += snprintf(parts + pos, sizeof(parts) - pos, "%"PRIu64"d ", d);
+    if (h > 0)
+        pos += snprintf(parts + pos, sizeof(parts) - pos, "%"PRIu64"h ", h);
+    if (m > 0)
+        pos += snprintf(parts + pos, sizeof(parts) - pos, "%"PRIu64"m ", m);
+    if (s > 0 || pos == 0)
+        pos += snprintf(parts + pos, sizeof(parts) - pos, "%"PRIu64"s", s);
+
+    while (pos > 0 && parts[pos - 1] == ' ')
+        parts[--pos] = '\0';
+
+    strncpy(buf, parts, buflen - 1);
+    buf[buflen - 1] = '\0';
+}
+
+/* Network hashrate formatting: strictly 3 digits + prefix + H/s */
+static void format_network_hashrate_human(double val, char *buf, size_t buflen)
+{
+    const char *units[] = {"H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"};
+    int unit_idx = 0;
+    while (val >= 1000.0 && unit_idx < 7) {
+        val /= 1000.0;
+        unit_idx++;
+    }
+    snprintf(buf, buflen, "%.3f%s", val, units[unit_idx]);
+}
+
+/* Network difficulty formatting: strictly 3 digits + prefix */
+static void format_network_diff_human(double val, char *buf, size_t buflen)
+{
+    const char *units[] = {"", "k", "M", "G", "T", "P", "E", "Z"};
+    int unit_idx = 0;
+    while (val >= 1000.0 && unit_idx < 7) {
+        val /= 1000.0;
+        unit_idx++;
+    }
+    snprintf(buf, buflen, "%.3f%s", val, units[unit_idx]);
+}
+
+/* Hashrate formatting: STRICTLY 2 decimal places. */
+static void hashrate_to_str2(double val, char *buf, size_t bufsiz)
+{
+    const char *units[] = {"", "k", "M", "G", "T", "P", "E", "Z"};
+    int unit_idx = 0;
+    while (val >= 1000.0 && unit_idx < 7) {
+        val /= 1000.0;
+        unit_idx++;
+    }
+    snprintf(buf, bufsiz, "%.2f%s", val, units[unit_idx]);
+}
+
+/* Structure for aggregating and sorting block history */
+typedef struct {
+    int height;
+    double diff;
+    double solution_difficulty;
+    char status[32];
+    char hash[68];
+    char wallet[MAX_USERNAME + 1];
+    char share_date[64];
+} block_item_t;
+
+static int block_height_desc(const void *a, const void *b)
+{
+    const block_item_t *ia = (const block_item_t *)a;
+    const block_item_t *ib = (const block_item_t *)b;
+    return (ib->height - ia->height);
+}
+
+/* Calculation and generation of the pool.blocks */
+static void update_pool_blocks_file(pool_t *ckp, sdata_t *sdata, const pool_stats_t *stats_copy)
+{
+    char dnam[512], s[512 + 64];
+    struct dirent *dir;
+    DIR *d;
+
+    snprintf(dnam, sizeof(dnam) - 1, "%s/pool/blocks", ckp->logdir);
+    d = opendir(dnam);
+    if (!d)
+        return;
+
+    size_t capacity = 128, count = 0;
+    block_item_t *items = ckalloc(capacity * sizeof(block_item_t));
+    int confirmed_count = 0, orphaned_count = 0;
+
+    while ((dir = readdir(d)) != NULL) {
+        if (!strcmp(dir->d_name, ".") || !strcmp(dir->d_name, ".."))
+            continue;
+
+        snprintf(s, sizeof(s), "%s/%s", dnam, dir->d_name);
+        FILE *fp = fopen(s, "re");
+        if (!fp)
+            continue;
+
+        struct stat fdbuf;
+        if (fstat(fileno(fp), &fdbuf) || fdbuf.st_size <= 0) {
+            fclose(fp);
+            continue;
+        }
+
+        char *buf = ckzalloc(fdbuf.st_size + 1);
+        size_t r = fread(buf, 1, fdbuf.st_size, fp);
+        fclose(fp);
+        if (r < 1) {
+            free(buf);
+            continue;
+        }
+
+        json_t *val = json_loads(buf, 0, NULL);
+        free(buf);
+        if (!val)
+            continue;
+
+        if (count >= capacity) {
+            capacity *= 2;
+            items = ckrealloc(items, capacity * sizeof(block_item_t));
+        }
+
+        block_item_t *bi = &items[count];
+        memset(bi, 0, sizeof(block_item_t));
+
+        json_get_int(&bi->height, val, "height");
+
+        /* We can read this as string and as number */
+        json_t *j_diff = json_object_get(val, "diff");
+        if (j_diff) {
+            if (json_is_string(j_diff))
+                bi->diff = strtod(json_string_value(j_diff), NULL);
+            else if (json_is_number(j_diff))
+                bi->diff = json_number_value(j_diff);
+        }
+
+        json_get_double(&bi->solution_difficulty, val, "solution_difficulty");
+
+        const char *st = json_string_value(json_object_get(val, "status"));
+        strncpy(bi->status, st ? st : "UNCONFIRMED", sizeof(bi->status) - 1);
+
+        const char *hsh = json_string_value(json_object_get(val, "hash"));
+        strncpy(bi->hash, hsh ? hsh : "", sizeof(bi->hash) - 1);
+
+        const char *wlt = json_string_value(json_object_get(val, "solvedby"));
+        strncpy(bi->wallet, wlt ? wlt : "", sizeof(bi->wallet) - 1);
+
+        const char *s_date = json_string_value(json_object_get(val, "share_date"));
+        strncpy(bi->share_date, s_date ? s_date : "", sizeof(bi->share_date) - 1);
+
+        if (!strcasecmp(bi->status, "CONFIRMED"))
+            confirmed_count++;
+        else if (!strcasecmp(bi->status, "ORPHANED") || !strcasecmp(bi->status, "REJECTED"))
+            orphaned_count++;
+
+        count++;
+        json_decref(val);
+    }
+    closedir(d);
+
+    if (count > 1)
+        qsort(items, count, sizeof(block_item_t), block_height_desc);
+
+    /* 1. blocks_solved, blocks_confirmed, blocks_orphaned, orphan_ratio */
+    int blocks_solved = (int)count;
+    char orphan_ratio_str[32];
+    double o_ratio = 0.0;
+    if (blocks_solved > 0)
+        o_ratio = ((double)orphaned_count * 100.0) / (double)blocks_solved;
+    snprintf(orphan_ratio_str, sizeof(orphan_ratio_str), "%.4f", o_ratio);
+
+    /* 2. Hashrate 15m and difficulty */
+    uint64_t pool_hs_15m = (uint64_t)llround(stats_copy->dsps15 * nonces);
+    char pool_hr_suffix[16];
+    suffix_string(stats_copy->dsps15 * nonces, pool_hr_suffix, 16, 0);
+
+    double net_diff = 0.0;
+    ck_rlock(&sdata->workbase_lock);
+    if (sdata->current_workbase)
+        net_diff = sdata->current_workbase->network_diff;
+    ck_runlock(&sdata->workbase_lock);
+    if (net_diff <= 0.0)
+        net_diff = (double)stats_copy->network_diff;
+
+    /* 3. Time to block */
+    uint64_t ttb_unix = 0;
+    if (pool_hs_15m > 0 && net_diff > 0.0)
+        ttb_unix = (uint64_t)llround((net_diff * nonces) / (double)pool_hs_15m);
+
+    char ttb_human[64];
+    format_timetoblock(ttb_unix, ttb_human, sizeof(ttb_human));
+
+    /* 4. Calculation of average effort (N = 5, 10, 50, 100, 500, 1000, all) */
+    char eff_5[16], eff_10[16], eff_50[16], eff_100[16], eff_500[16], eff_1000[16], eff_all[16];
+    int windows[] = {5, 10, 50, 100, 500, 1000};
+    char *eff_ptrs[] = {eff_5, eff_10, eff_50, eff_100, eff_500, eff_1000};
+
+    for (int w = 0; w < 6; w++) {
+        int win = windows[w];
+        int k = win < blocks_solved ? win : blocks_solved;
+        double sum = 0.0;
+        if (k > 0) {
+            for (int i = 0; i < k; i++)
+                sum += items[i].diff;
+            snprintf(eff_ptrs[w], 16, "%.2f", sum / (double)k);
+        } else {
+            snprintf(eff_ptrs[w], 16, "0.00");
+        }
+    }
+    double sum_all = 0.0;
+    if (blocks_solved > 0) {
+        for (int i = 0; i < blocks_solved; i++)
+            sum_all += items[i].diff;
+        snprintf(eff_all, 16, "%.2f", sum_all / (double)blocks_solved);
+    } else {
+        snprintf(eff_all, 16, "0.00");
+    }
+
+    /* 5. Data of the last block (items[0]) */
+    int last_h = 0;
+    double last_share = 0.0, last_eff = 0.0;
+    const char *last_hash = "", *last_wallet = "", *last_time = "", *last_status = "";
+
+    if (blocks_solved > 0) {
+        last_h = items[0].height;
+        last_hash = items[0].hash;
+        last_wallet = items[0].wallet;
+        last_time = items[0].share_date;
+        last_share = items[0].solution_difficulty;
+        last_eff = items[0].diff;
+        last_status = items[0].status;
+    }
+
+    /* Packaging into JSON strictly in the required order. */
+    json_t *pj = json_object();
+    json_set_int(pj, "blocks_solved", blocks_solved);
+    json_set_int(pj, "blocks_confirmed", confirmed_count);
+    json_set_int(pj, "blocks_orphaned", orphaned_count);
+    json_set_string(pj, "orphan_ratio", orphan_ratio_str);
+    json_set_string(pj, "pool_hashrate15m", pool_hr_suffix);
+    json_set_int64(pj, "pool_hashrate15m_hs", (int64_t)pool_hs_15m);
+    json_set_double(pj, "network_difficulty", net_diff);
+    json_set_int64(pj, "timetoblock_unix", (int64_t)ttb_unix);
+    json_set_string(pj, "timetoblock_human", ttb_human);
+    json_set_string(pj, "effort_last5", eff_5);
+    json_set_string(pj, "effort_last10", eff_10);
+    json_set_string(pj, "effort_last50", eff_50);
+    json_set_string(pj, "effort_last100", eff_100);
+    json_set_string(pj, "effort_last500", eff_500);
+    json_set_string(pj, "effort_last1000", eff_1000);
+    json_set_string(pj, "effort_all", eff_all);
+    json_set_int(pj, "last_solved_block_height", last_h);
+    json_set_string(pj, "last_solved_block_hash", last_hash);
+    json_set_string(pj, "last_solved_block_wallet", last_wallet);
+    json_set_string(pj, "last_solved_block_timeutc", last_time);
+    json_set_double(pj, "last_solved_block_share", last_share);
+    json_set_double(pj, "last_solved_block_effort", last_eff);
+    json_set_string(pj, "last_solved_block_status", last_status);
+
+    char fname[512];
+    snprintf(fname, sizeof(fname) - 1, "%s/pool/pool.blocks", ckp->logdir);
+    FILE *fp = fopen(fname, "we");
+    if (fp) {
+        char *str = json_dumps(pj, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
+        if (str) {
+            fprintf(fp, "%s", str);
+            free(str);
+        }
+        fclose(fp);
+    }
+    json_decref(pj);
+    free(items);
+}
+
+/* Canonical RFC 4648 Base64 encoder with correct padding '=' */
+static void b64_encode(const char *in, size_t in_len, char *out, size_t out_len)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0, j = 0;
+
+    while (i < in_len && j + 4 < out_len) {
+        size_t rem = in_len - i;
+        uint32_t a = (unsigned char)in[i++];
+        uint32_t b = (rem > 1) ? (unsigned char)in[i++] : 0;
+        uint32_t c = (rem > 2) ? (unsigned char)in[i++] : 0;
+        uint32_t n = (a << 16) | (b << 8) | c;
+
+        out[j++] = tbl[(n >> 18) & 0x3F];
+        out[j++] = tbl[(n >> 12) & 0x3F];
+        out[j++] = (rem > 1) ? tbl[(n >> 6) & 0x3F] : '=';
+        out[j++] = (rem > 2) ? tbl[n & 0x3F] : '=';
+    }
+    out[j] = '\0';
+}
+
+/* Standalone HTTP JSON-RPC request to a node via standard POSIX sockets. */
+static json_t *rpc_call_node(pool_t *ckp, const char *method)
+{
+    if (!ckp->btcds || !ckp->btcdurl[0])
+        return NULL;
+
+    /* Extract the host and port from ckp->btcdurl[0] */
+    char host[128] = "127.0.0.1", port[16] = "8332";
+    const char *p = ckp->btcdurl[0];
+    if (!strncasecmp(p, "http://", 7))
+        p += 7;
+    else if (!strncasecmp(p, "https://", 8))
+        p += 8;
+
+    const char *colon = strrchr(p, ':');
+    if (colon) {
+        size_t hlen = colon - p;
+        if (hlen < sizeof(host)) {
+            memcpy(host, p, hlen);
+            host[hlen] = '\0';
+        }
+        strncpy(port, colon + 1, sizeof(port) - 1);
+        char *slash = strchr(port, '/');
+        if (slash) *slash = '\0';
+    } else {
+        strncpy(host, p, sizeof(host) - 1);
+        char *slash = strchr(host, '/');
+        if (slash) *slash = '\0';
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res)
+        return NULL;
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return NULL;
+    }
+
+    /* Waiting 2 sec if the node does not answer fast */
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        close(sock);
+        freeaddrinfo(res);
+        return NULL;
+    }
+    freeaddrinfo(res);
+
+    /*  auth + pass for Basic Auth */
+    char b64_auth[512] = "";
+    if (ckp->btcdauth[0]) {
+        char userpwd[384];
+        if (strchr(ckp->btcdauth[0], ':')) {
+            snprintf(userpwd, sizeof(userpwd), "%s", ckp->btcdauth[0]);
+        } else if (ckp->btcdpass[0] && strlen(ckp->btcdpass[0])) {
+            snprintf(userpwd, sizeof(userpwd), "%s:%s", ckp->btcdauth[0], ckp->btcdpass[0]);
+        } else {
+            snprintf(userpwd, sizeof(userpwd), "%s", ckp->btcdauth[0]);
+        }
+        b64_encode(userpwd, strlen(userpwd), b64_auth, sizeof(b64_auth));
+    }
+
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"jsonrpc\":\"1.0\",\"id\":\"pool_node\",\"method\":\"%s\",\"params\":[]}",
+             method);
+
+    char req[1024];
+    int req_len = snprintf(req, sizeof(req),
+        "POST / HTTP/1.1\r\n"
+        "Host: %s:%s\r\n"
+        "Authorization: Basic %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n%s",
+        host, port, b64_auth, strlen(body), body);
+
+    if (send(sock, req, req_len, 0) < 0) {
+        close(sock);
+        return NULL;
+    }
+
+    size_t capacity = 16384, received = 0;
+    char *resp = ckalloc(capacity);
+    ssize_t n;
+    while ((n = recv(sock, resp + received, capacity - received - 1, 0)) > 0) {
+        received += n;
+        if (received + 2048 >= capacity) {
+            capacity *= 2;
+            resp = ckrealloc(resp, capacity);
+        }
+    }
+    close(sock);
+    resp[received] = '\0';
+
+    /* Check for authorization error */
+    if (strstr(resp, "401 Unauthorized")) {
+        LOGWARNING("node.status: Node returned 401 Unauthorized! Check RPC credentials");
+        free(resp);
+        return NULL;
+    }
+
+    char *body_start = strstr(resp, "\r\n\r\n");
+    if (!body_start) {
+        free(resp);
+        return NULL;
+    }
+    body_start += 4;
+
+    json_t *root = json_loads(body_start, 0, NULL);
+    free(resp);
+    if (!root)
+        return NULL;
+
+    json_t *result = json_object_get(root, "result");
+    json_t *ret = result ? json_deep_copy(result) : NULL;
+    json_decref(root);
+    return ret;
+}
+
+/* Node polling and generation of the node.status file */
+static void update_node_status_file(pool_t *ckp)
+{
+    json_t *minfo = rpc_call_node(ckp, "getmininginfo");
+    json_t *netinfo = rpc_call_node(ckp, "getnetworkinfo");
+
+    double net_hashrate = 0.0;
+    double net_diff = 0.0;
+    int cur_height = 0;
+    int mempool_tx = 0;
+    const char *subversion = "";
+    int conns = 0, conns_in = 0, conns_out = 0;
+
+    if (minfo) {
+        /* Универсальное считывание: принимает и дробные числа (JSON_REAL), и целые (JSON_INTEGER) */
+        json_t *j_hr = json_object_get(minfo, "networkhashps");
+        if (j_hr && json_is_number(j_hr))
+            net_hashrate = json_number_value(j_hr);
+
+        json_t *j_diff = json_object_get(minfo, "difficulty");
+        if (j_diff && json_is_number(j_diff))
+            net_diff = json_number_value(j_diff);
+
+        json_get_int(&cur_height, minfo, "blocks");
+        json_get_int(&mempool_tx, minfo, "pooledtx");
+    }
+    if (netinfo) {
+        const char *sv = json_string_value(json_object_get(netinfo, "subversion"));
+        if (sv) subversion = sv;
+        json_get_int(&conns, netinfo, "connections");
+        json_get_int(&conns_in, netinfo, "connections_in");
+        json_get_int(&conns_out, netinfo, "connections_out");
+    }
+
+    char net_hr_human[64], net_diff_human[64];
+    format_network_hashrate_human(net_hashrate, net_hr_human, sizeof(net_hr_human));
+    format_network_diff_human(net_diff, net_diff_human, sizeof(net_diff_human));
+
+    json_t *nj = json_object();
+    json_set_double(nj, "network_hasrate", net_hashrate);
+    json_set_string(nj, "network_hashrate_human", net_hr_human);
+    json_set_double(nj, "network_difficulty", net_diff);
+    json_set_string(nj, "network_difficulty_human", net_diff_human);
+    json_set_int(nj, "current_height", cur_height);
+    json_set_int(nj, "mempool_tx", mempool_tx);
+    json_set_string(nj, "node_subversion", subversion);
+    json_set_int(nj, "activeconnections", conns);
+    json_set_int(nj, "activeconnections_in", conns_in);
+    json_set_int(nj, "activeconnections_out", conns_out);
+
+    char fname[512];
+    snprintf(fname, sizeof(fname) - 1, "%s/node.status", ckp->logdir);
+    FILE *fp = fopen(fname, "we");
+    if (fp) {
+        char *str = json_dumps(nj, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
+        if (str) {
+            fprintf(fp, "%s", str);
+            free(str);
+        }
+        fclose(fp);
+    }
+    json_decref(nj);
+    if (minfo) json_decref(minfo);
+    if (netinfo) json_decref(netinfo);
+}
+
 static void *statsupdate(void *arg)
 {
     pool_t * const ckp = (pool_t *)arg;
@@ -9323,8 +10186,8 @@ static void *statsupdate(void *arg)
     while (42) {
         double ghs, ghs1, ghs5, ghs15, ghs60, ghs360, ghs1440, ghs10080,
             per_tdiff, hmul = 1, lmul = 1, rolling_herp, rolling_lns,
-            reward, derp, percent;
-        char suffix1[16], suffix5[16], suffix15[16], suffix60[16], cdfield[64];
+            reward, derp, percent, net_diff = 0.0;
+        char suffix1[16], suffix5[16], suffix15[16], suffix60[16], suffix240[16], cdfield[64];
         char suffix360[16], suffix1440[16], suffix10080[16];
         char pcstring[32];
         int remote_users = 0, remote_workers = 0, idle_workers = 0, cbspace = 0, payouts = 0;
@@ -9378,6 +10241,7 @@ static void *statsupdate(void *arg)
         stats->rolling_lns += lns;
         rolling_lns = stats->rolling_lns;
         reward = stats->reward;
+        net_diff = (double)stats->network_diff;
         mutex_unlock(&sdata->stats_lock);
 
         ck_wlock(&sdata->instance_lock);
@@ -9438,6 +10302,8 @@ static void *statsupdate(void *arg)
             bool idle = false, inactive = false;
             worker_instance_t *worker;
             json_t *user_array;
+            int64_t u_accepted = 0, u_rejected = 0;
+            double rj_ratio = 0.0, user_diff = 0.0;
 
             if (!user->authorized)
                 continue;
@@ -9481,32 +10347,35 @@ static void *statsupdate(void *arg)
                 }
 
                 ghs = worker->dsps1 * nonces;
-                suffix_string(ghs, suffix1, 16, 0);
+                hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
 
                 ghs = worker->dsps5 * nonces;
-                suffix_string(ghs, suffix5, 16, 0);
+                hashrate_to_str2(ghs, suffix5, sizeof(suffix5));
 
                 ghs = worker->dsps60 * nonces;
-                suffix_string(ghs, suffix60, 16, 0);
+                hashrate_to_str2(ghs, suffix60, sizeof(suffix60));
+
+                ghs = worker->dsps240 * nonces;
+                hashrate_to_str2(ghs, suffix240, sizeof(suffix240));
 
                 ghs = worker->dsps1440 * nonces;
-                suffix_string(ghs, suffix1440, 16, 0);
+                hashrate_to_str2(ghs, suffix1440, sizeof(suffix1440));
 
                 ghs = worker->dsps10080 * nonces;
-                suffix_string(ghs, suffix10080, 16, 0);
-                /* Do not store if hashrate for 7d exists only */
+                hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
                 LOGDEBUG("Storing worker %s", worker->workername);
 
-                if (fabs(worker->lns) > 0.) // guard against crashes due to FPE exception
+                if (fabs(worker->lns) > 0.)
                     percent = round(worker->herp / worker->lns * 100) / 100;
                 else
                     percent = 1.0;
-                JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
+                JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
                            "workername", worker->workername,
                            "hashrate1m", suffix1,
                            "hashrate5m", suffix5,
                            "hashrate1hr", suffix60,
+                           "hashrate4hr", suffix240,
                            "hashrate1d", suffix1440,
                            "hashrate7d", suffix10080,
                            "lastshare", (json_int_t)worker->last_share.tv_sec,
@@ -9528,20 +10397,23 @@ static void *statsupdate(void *arg)
                 if (per_tdiff > 600)
                     inactive = true;
             }
-            ghs = user->dsps1 * nonces;
-            suffix_string(ghs, suffix1, 16, 0);
+               	ghs = user->dsps1 * nonces;
+            	hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
+            
+            	ghs = user->dsps5 * nonces;
+            	hashrate_to_str2(ghs, suffix5, sizeof(suffix5));
+            
+            	ghs = user->dsps60 * nonces;
+            	hashrate_to_str2(ghs, suffix60, sizeof(suffix60));
 
-            ghs = user->dsps5 * nonces;
-            suffix_string(ghs, suffix5, 16, 0);
-
-            ghs = user->dsps60 * nonces;
-            suffix_string(ghs, suffix60, 16, 0);
-
-            ghs = user->dsps1440 * nonces;
-            suffix_string(ghs, suffix1440, 16, 0);
-
-            ghs = user->dsps10080 * nonces;
-            suffix_string(ghs, suffix10080, 16, 0);
+            	ghs = user->dsps240 * nonces;
+            	hashrate_to_str2(ghs, suffix240, sizeof(suffix240));
+            
+            	ghs = user->dsps1440 * nonces;
+            	hashrate_to_str2(ghs, suffix1440, sizeof(suffix1440));
+            
+            	ghs = user->dsps10080 * nonces;
+            	hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
             mutex_lock(&user->stats_lock);
             if (hmul != 1)
@@ -9552,7 +10424,27 @@ static void *statsupdate(void *arg)
                 user->lns *= lmul;
             user->lns += user->ua_lns;
             user->ua_lns = 0;
+            u_accepted = user->accepted;
+            u_rejected = user->rejected;
             mutex_unlock(&user->stats_lock);
+
+            /* Calculate rejected ratio: (rejected / (accepted + rejected)) * 100 */
+            int64_t user_total = u_accepted + u_rejected;
+            if (user_total > 0)
+                rj_ratio = ((double)u_rejected * 100.0) / (double)user_total;
+            else
+                rj_ratio = 0.0;
+
+            /* Calculate round share diff ratio vs BCH network diff */
+            if (net_diff > 0.0)
+                user_diff = ((double)u_accepted * 100.0) / net_diff;
+            else
+                user_diff = 0.0;
+
+            /* Format with exact 4 decimals without binary floating-point artifacts */
+            char rj_str[32], diff_str[32];
+            snprintf(rj_str, sizeof(rj_str), "%.4f", rj_ratio);
+            snprintf(diff_str, sizeof(diff_str), "%.4f", user_diff);
 
             /* Round to satoshi, change to BTC, removing fee */
             derp = floor(reward * (user->herp +user->accumulated) / rolling_herp * 0.995);
@@ -9566,10 +10458,11 @@ static void *statsupdate(void *arg)
                 percent = round(user->herp / user->lns * 100) / 100;
             else
                 percent = 1.0;
-            JSON_CPACK(val, "{ss,ss,ss,ss,ss,sI,si,sI,sf,sf,sf,sf,sf,si,sf,sf,sI}",
+            JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,sI,si,sI,sf,sf,sI,sI,ss,ss,sf,sf,sf,si,sf,sf,sI}",
                        "hashrate1m", suffix1,
                        "hashrate5m", suffix5,
                        "hashrate1hr", suffix60,
+                       "hashrate4hr", suffix240,
                        "hashrate1d", suffix1440,
                        "hashrate7d", suffix10080,
                        "lastshare", (json_int_t)user->last_share.tv_sec,
@@ -9577,6 +10470,10 @@ static void *statsupdate(void *arg)
                        "shares", (json_int_t)user->shares,
                        "bestshare", user->best_diff,
                        "bestshare_alltime", user->best_diff_alltime,
+                       "accepted", (json_int_t)u_accepted,
+                       "rejected", (json_int_t)u_rejected,
+                       "rj_ratio", rj_str,
+                       "diff", diff_str,
                        "lns", user->lns,
                        "luck", percent,
                        "accumulated", user->accumulated,
@@ -9608,6 +10505,30 @@ static void *statsupdate(void *arg)
                 ASPRINTF(&sp, "%s:%s\n", user->username, s);
                 dealloc(s);
                 add_onelog_entry_descending(&miner_entries, &sp, user->dsps1);
+                
+                /* User hashrate history record */
+                char u_hist_file[512], u_stamp[128];
+                get_timestamp(u_stamp, sizeof(u_stamp), ckp->localtime_logging);
+                snprintf(u_hist_file, sizeof(u_hist_file) - 1, "%s/history/users/%s", ckp->logdir, user->username);
+                FILE *fp_u = fopen(u_hist_file, "ae");
+                if (fp_u) {
+                    json_t *u_val;
+                    JSON_CPACK(u_val, "{ss,ss,ss,ss,ss,ss,sI}",
+                               "hashrate1m", suffix1,
+                               "hashrate5m", suffix5,
+                               "hashrate1hr", suffix60,
+                               "hashrate4hr", suffix240,
+                               "hashrate1d", suffix1440,
+                               "hashrate7d", suffix10080,
+                               "time", (json_int_t)now.tv_sec);
+                    char *u_str = json_dumps(u_val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_COMPACT);
+                    json_decref(u_val);
+                    if (u_str) {
+                        fprintf(fp_u, "%s User %s:%s\n", u_stamp, user->username, u_str);
+                        free(u_str);
+                    }
+                    fclose(fp_u);
+                }
             }
             json_object_set_new_nocheck(val, "worker", user_array);
             ASPRINTF(&fname, "%s/users/%s", ckp->logdir, user->username);
@@ -9637,27 +10558,39 @@ static void *statsupdate(void *arg)
         ASPRINTF(&fname, "%s/pool/pool.miners", ckp->logdir);
         dump_onelog_entries(&fname, &miner_entries);
         notice_msg_entries(&char_list);
+        
+        /* 1. Automatic check of unconfirmed blocks every minute (recovery from network lag) */
+        if (sdata->stats.unconfirmed) {
+            int cur_h = 0;
+            ck_rlock(&sdata->workbase_lock);
+            if (sdata->current_workbase)
+                cur_h = sdata->current_workbase->height;
+            ck_runlock(&sdata->workbase_lock);
 
-        ghs1 = stats_copy->dsps1 * nonces;
-        suffix_string(ghs1, suffix1, 16, 0);
+            if (cur_h > 0)
+                check_unconfirmed(ckp, sdata, cur_h);
+        }
 
-        ghs5 = stats_copy->dsps5 * nonces;
-        suffix_string(ghs5, suffix5, 16, 0);
+        /* 2. Periodic audit of the ~/blocks folder on disk every 60 minutes (we are searching for orphaned files) */
+        static int hourly_audit_counter = 0;
+        if (++hourly_audit_counter >= 60) {
+            hourly_audit_counter = 0;
+            read_unconfirmed_blocks(ckp, sdata);
+        }
 
-        ghs15 = stats_copy->dsps15 * nonces;
-        suffix_string(ghs15, suffix15, 16, 0);
-
-        ghs60 = stats_copy->dsps60 * nonces;
-        suffix_string(ghs60, suffix60, 16, 0);
-
-        ghs360 = stats_copy->dsps360 * nonces;
-        suffix_string(ghs360, suffix360, 16, 0);
-
-        ghs1440 = stats_copy->dsps1440 * nonces;
-        suffix_string(ghs1440, suffix1440, 16, 0);
-
-        ghs10080 = stats_copy->dsps10080 * nonces;
-        suffix_string(ghs10080, suffix10080, 16, 0);
+        hashrate_to_str2(stats_copy->dsps1 * nonces, suffix1, sizeof(suffix1));
+        
+        hashrate_to_str2(stats_copy->dsps5 * nonces, suffix5, sizeof(suffix5));
+        
+        hashrate_to_str2(stats_copy->dsps15 * nonces, suffix15, sizeof(suffix15));
+        
+        hashrate_to_str2(stats_copy->dsps60 * nonces, suffix60, sizeof(suffix60));
+        
+        hashrate_to_str2(stats_copy->dsps360 * nonces, suffix360, sizeof(suffix360));
+        
+        hashrate_to_str2(stats_copy->dsps1440 * nonces, suffix1440, sizeof(suffix1440));
+        
+        hashrate_to_str2(stats_copy->dsps10080 * nonces, suffix10080, sizeof(suffix10080));
 
         ASPRINTF(&fname, "%s/pool/pool.status", ckp->logdir);
         fp = fopen(fname, "we");
@@ -9690,8 +10623,19 @@ static void *statsupdate(void *arg)
         json_decref(val);
         LOGNOTICE("Pool:%s", s);
         if (likely(fp)) fprintf(fp, "%s\n", s);
+        
+         /* Pool hashrate history record*/
+        char hrfile[512], hr_stamp[128];
+        get_timestamp(hr_stamp, sizeof(hr_stamp), ckp->localtime_logging);
+        snprintf(hrfile, sizeof(hrfile) - 1, "%s/history/hashrate/pool.hashrate", ckp->logdir);
+        FILE *fp_hr = fopen(hrfile, "ae");
+        if (fp_hr) {
+            fprintf(fp_hr, "%s Pool:%s\n", hr_stamp, s);
+            fclose(fp_hr);
+        }     
+        
         dealloc(s);
-
+        
         JSON_CPACK(val, "{sf,sf,sf,sf}",
                    "SPS1m", stats_copy->sps1,
                    "SPS5m", stats_copy->sps5,
@@ -9703,12 +10647,26 @@ static void *statsupdate(void *arg)
         if (likely(fp)) fprintf(fp, "%s\n", s);
         dealloc(s);
 
-        percent = (double)stats_copy->accounted_diff_shares * 100.0 / (double)stats_copy->network_diff;
+/* We should not divide by 0 here. */
+if (stats_copy->network_diff > 0)
+            percent = (double)stats_copy->accounted_diff_shares * 100.0 / (double)stats_copy->network_diff;
+        else
+            percent = 0.0;
         snprintf(pcstring, 31, "%.2f", percent);
-        JSON_CPACK(val, "{ss,sI,sI,sf,sf,sf,sf,sf}",
+
+        /* Calculation of the pool rejection rate with protection against division by 0. */
+        double pool_rj = 0.0;
+        char pool_rj_str[32];
+        int64_t pool_total = stats_copy->accounted_diff_shares + stats_copy->accounted_rejects;
+		if (pool_total > 0)
+    	pool_rj = ((double)stats_copy->accounted_rejects * 100.0) / (double)pool_total;
+        snprintf(pool_rj_str, sizeof(pool_rj_str), "%.4f", pool_rj);
+
+        JSON_CPACK(val, "{ss,sI,sI,ss,sf,sf,sf,sf,sf}",
                    "diff", pcstring,
                    "accepted", (json_int_t)stats_copy->accounted_diff_shares,
                    "rejected", (json_int_t)stats_copy->accounted_rejects,
+                   "pool_rj_ratio", pool_rj_str,
                    "bestshare", stats_copy->best_diff,
                    "bestshare_alltime", stats_copy->best_diff_alltime,
                    "lns", rolling_lns,
@@ -9721,6 +10679,10 @@ static void *statsupdate(void *arg)
         if (likely(fp)) fprintf(fp, "%s\n", s);
         dealloc(s);
         if (likely(fp)) fclose(fp);
+        
+        /* Updating of block summary and node status every 60 seconds. */
+        update_pool_blocks_file(ckp, sdata, stats_copy); 
+        update_node_status_file(ckp);
 
         ck_rlock(&sdata->workbase_lock);
         if (likely(sdata->current_workbase && sdata->current_workbase->payout))
@@ -10024,6 +10986,8 @@ static bool get_chain_and_prefix(pool_t *ckp)
     return true;
 }
 
+
+
 void *stratifier(void *arg)
 {
     proc_instance_t *pi = (proc_instance_t *)arg;
@@ -10108,6 +11072,10 @@ void *stratifier(void *arg)
     sdata->srecvs = create_ckmsgqs(ckp, "sreceiver", &srecv_process, threads);
     read_poolstats(ckp, &tvsec_diff);
     read_userstats(ckp, sdata, tvsec_diff);
+    read_unconfirmed_blocks(ckp, sdata); /* Restore unconfirmed blocks from the disk */
+    
+    /* Create the logs/history/ folder structure when starting the pool. */
+    ensure_history_dirs(ckp->logdir);
 
     /* Calculate base user paygens for the first workbase to have something
      * to work with. */
