@@ -3055,7 +3055,7 @@ static void block_reject(json_t *val);
 static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
 {
     char *coinbase = NULL, *enonce1 = NULL, *nonce = NULL, *nonce2 = NULL, *gbt_block,
-        *coinbasehex, *swaphex;
+        *coinbasehex = NULL, *swaphex = NULL;
     size_t gbt_block_len;
     uchar *enonce1bin = NULL, hash[32], swap[80], flip32[32];
     uint32_t ntime32, version_mask = 0;
@@ -3165,6 +3165,9 @@ out:
     free(nonce2);
     free(nonce);
     free(enonce1);
+    /* Free duplicated hex strings to prevent memory leaks */
+    free(coinbasehex);
+    free(swaphex);
 }
 
 static void update_base(sdata_t *sdata, const int prio)
