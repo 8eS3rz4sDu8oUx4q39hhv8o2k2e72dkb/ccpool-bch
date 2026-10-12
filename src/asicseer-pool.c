@@ -252,7 +252,8 @@ bool ckmsgq_add_(ckmsgq_t *ckmsgq, void *data, const char *file, const char *fun
     mutex_lock(ckmsgq->lock);
     ckmsgq->messages++;
     DL_APPEND(ckmsgq->msgs, msg);
-    pthread_cond_broadcast(ckmsgq->cond);
+    /* Signal only one worker thread to consume this task, avoiding thundering herd contention */
+    pthread_cond_signal(ckmsgq->cond);
     mutex_unlock(ckmsgq->lock);
 
     return true;
