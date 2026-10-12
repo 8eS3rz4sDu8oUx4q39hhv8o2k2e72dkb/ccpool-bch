@@ -357,8 +357,9 @@ void generator_preciousblock(pool_t *ckp, const char *hash)
     server_instance_t *si;
     connsock_t *cs;
 
-    if (unlikely(!(si = gdata->current_si))) {
-        LOGWARNING("No live current server in generator_get_blockhash");
+    /* Use thread-safe accessor to protect current_si access under mutex */
+    if (unlikely(!(si = get_current_si_threadsafe(gdata)))) {
+        LOGWARNING("No live current server in generator_preciousblock");
         return;
     }
     cs = &si->cs;
