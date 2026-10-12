@@ -2153,7 +2153,7 @@ static void check_unconfirmed(pool_t *ckp, sdata_t *sdata, const int height)
  * into the in-memory queue (with duplicate protection). */
 static void read_unconfirmed_blocks(pool_t *ckp, sdata_t *sdata)
 {
-    char dnam[512], s[512 + 64];
+    char dnam[512], s[1024];
     struct dirent *dir;
     int count = 0;
     DIR *d;
@@ -9757,7 +9757,7 @@ static int block_height_desc(const void *a, const void *b)
 /* Calculation and generation of the pool.blocks */
 static void update_pool_blocks_file(pool_t *ckp, sdata_t *sdata, const pool_stats_t *stats_copy)
 {
-    char dnam[512], s[512 + 64];
+    char dnam[512], s[1024];
     struct dirent *dir;
     DIR *d;
 
