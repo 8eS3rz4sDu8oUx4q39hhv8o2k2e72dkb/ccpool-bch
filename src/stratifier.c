@@ -10119,7 +10119,7 @@ static void update_node_status_file(pool_t *ckp)
     int conns = 0, conns_in = 0, conns_out = 0;
 
     if (minfo) {
-        /* Универсальное считывание: принимает и дробные числа (JSON_REAL), и целые (JSON_INTEGER) */
+        /* Universal reading: accepts both fractional numbers (JSON_REAL) and integers (JSON_INTEGER) */
         json_t *j_hr = json_object_get(minfo, "networkhashps");
         if (j_hr && json_is_number(j_hr))
             net_hashrate = json_number_value(j_hr);
