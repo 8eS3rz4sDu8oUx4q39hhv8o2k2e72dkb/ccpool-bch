@@ -54,7 +54,7 @@ typedef int (*get_func)(void *data);
 typedef struct {
     get_func get;
     void *data;
-    char buffer[5];
+    char buffer[8];
     size_t buffer_pos;
     int state;
     int line;
