@@ -169,7 +169,7 @@ static int stream_get(stream_t *stream, json_error_t *error) {
             size_t i, count;
 
             count = utf8_check_first(c);
-            if (!count)
+            if (!count || count >= sizeof(stream->buffer))
                 goto out;
 
             assert(count >= 2);
