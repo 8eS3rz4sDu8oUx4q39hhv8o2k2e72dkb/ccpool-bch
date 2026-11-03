@@ -2112,7 +2112,6 @@ static void check_unconfirmed(pool_t *ckp, sdata_t *sdata, const int height)
 
         json_get_string(&rhash, found->val, "hash");
         ret = !strncmp(rhash, heighthash, 64);
-        dealloc(rhash);
 
         if (ret)
             confirm_block(sdata, found->val);
@@ -2126,8 +2125,23 @@ static void check_unconfirmed(pool_t *ckp, sdata_t *sdata, const int height)
         json_set_string(found->val, "status", ret ? "CONFIRMED" : "ORPHANED");
 
         ASPRINTF(&fname, "%s/pool/blocks/%d.unconfirmed", ckp->logdir, solveheight);
-        ASPRINTF(&newname, "%s/pool/blocks/%d.%s", ckp->logdir, solveheight, ret ?
-            "confirmed" : "orphaned");
+
+        if (ret) {
+            /* Canonical winning block: strictly <height>.confirmed */
+            ASPRINTF(&newname, "%s/pool/blocks/%d.confirmed", ckp->logdir, solveheight);
+        } else {
+            /* Default orphan filename */
+            ASPRINTF(&newname, "%s/pool/blocks/%d.orphaned", ckp->logdir, solveheight);
+            /* If an orphan file for this height already exists, append the last 8 chars of hash to prevent overwriting */
+            if (access(newname, F_OK) == 0) {
+                dealloc(newname);
+                const char *shorthash = (rhash && strlen(rhash) >= 8) ? (rhash + strlen(rhash) - 8) : "orphan";
+                ASPRINTF(&newname, "%s/pool/blocks/%d_%s.orphaned", ckp->logdir, solveheight, shorthash);
+            }
+        }
+
+        /* Free rhash only after building the filename */
+        dealloc(rhash);
 
         /* Atomically rewrite JSON to new file and remove obsolete .unconfirmed */
         FILE *fp = fopen(newname, "we");
@@ -7439,10 +7453,18 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         json_set_double(blockval, "network_difficulty", sdata->current_workbase->network_diff);
         json_set_double(blockval, "solution_difficulty", diff);
 
-        /* Set status to REJECTED */
+       /* Set status to REJECTED */
         json_set_string(blockval, "status", "REJECTED");
 
+        /* Default rejected filename */
         ASPRINTF(&fname, "%s/pool/blocks/%d.rejected", ckp->logdir, wb->height);
+        /* If a rejected file for this height already exists, append the last 8 chars of hash to prevent overwriting */
+        if (access(fname, F_OK) == 0) {
+            dealloc(fname);
+            const char *shorthash = (strlen(rhash) >= 8) ? (rhash + strlen(rhash) - 8) : "rejected";
+            ASPRINTF(&fname, "%s/pool/blocks/%d_%s.rejected", ckp->logdir, wb->height, shorthash);
+        }
+
         fp = fopen(fname, "we");
         if (likely(fp)) {
             s = json_dumps(blockval, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
