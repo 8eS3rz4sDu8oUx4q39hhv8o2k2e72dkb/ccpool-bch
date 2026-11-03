@@ -17,8 +17,8 @@
 // or specify "disable_dev_donation": true in the conf file as a top-level key.
 #define DONATION_FRACTION 10
 
-#define DONATION_ADDRESS_CALIN "1EEEEEE7sSJEVwXSMTcWkPo8u7bbMoNESx" // Calin (dev)
-#define DONATION_ADDRESS_BCHN "122228mQML6euX87Z9p3qgJbk2QatwTRe8"  // BCHN donation wallet
+#define DONATION_ADDRESS_CALIN "1Ca1inCimwRhhcpFX84TPRrPQSryTgKW6N" // Calin (dev)
+#define DONATION_ADDRESS_BCHN "3NoBpEBHZq6YqwUBdPAMW41w5BTJSC7yuQ"  // BCHN donation wallet
 #define DONATION_NUM_ADDRESSES 2
 
 #endif // DONATION_H
