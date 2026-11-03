@@ -4686,26 +4686,24 @@ static void remap_workinfo_id(sdata_t *sdata, json_t *val, const int64_t client_
     json_set_int64(val, "workinfoid", mapped_id);
 }
 
-/* Note: this takes: sdata->workbase_lock & sdata->stats_lock; so must be entered with no locks held! */
-static void block_share_summary(sdata_t *sdata)
+/* Note: entered with no locks held */
+static void block_share_summary(sdata_t *sdata, int64_t shares, double network_diff, double effort_pct)
 {
-    double network_diff, effort_pct;
-    int64_t accounted_diff_shares;
+    /* Fallback protection: if network_diff wasn't provided, read from current_workbase */
+    if (unlikely(network_diff <= 0.0)) {
+        ck_rlock(&sdata->workbase_lock);
+        if (sdata && sdata->current_workbase)
+            network_diff = sdata->current_workbase->network_diff;
+        ck_runlock(&sdata->workbase_lock);
 
-    ck_rlock(&sdata->workbase_lock);
-    network_diff = sdata && sdata->current_workbase ? sdata->current_workbase->network_diff : 0.0;
-    ck_runlock(&sdata->workbase_lock);
+        if (network_diff > 0.0 && effort_pct <= 0.0)
+            effort_pct = ((double)shares / network_diff) * 100.0;
+    }
 
     if (unlikely(network_diff <= 0.0))
         return;
 
-    mutex_lock(&sdata->stats_lock);
-    accounted_diff_shares = sdata->stats.accounted_diff_shares;
-    mutex_unlock(&sdata->stats_lock);
-
-    effort_pct = (accounted_diff_shares / network_diff) * 100.0;
-
-    LOGWARNING("Block solved after %" PRId64 " shares at %.2f%% effort", accounted_diff_shares, effort_pct);
+    LOGWARNING("Block solved after %" PRId64 " shares at %.2f%% effort", shares, effort_pct);
 }
 
 static void block_solve(pool_t *ckp, json_t *val)
@@ -4716,6 +4714,8 @@ static void block_solve(pool_t *ckp, json_t *val)
     double diff = 0;
     int height = 0;
     ts_t ts_now;
+    int64_t solved_shares = 0;
+    double solved_net_diff = 0.0, solved_effort = 0.0;
 
     if (!ckp->node) {
         // if we have notifiers, request an update_base at lower priority since
@@ -4733,6 +4733,11 @@ static void block_solve(pool_t *ckp, json_t *val)
     json_get_int(&height, val, "height");
     json_get_double(&diff, val, "diff");
     json_get_string(&workername, val, "workername");
+
+    /* Extract parameters BEFORE val is consumed and freed by ckdbq_add / upstream_json */
+    json_get_int64(&solved_shares, val, "shares");
+    json_get_double(&solved_net_diff, val, "network_difficulty");
+    json_get_double(&solved_effort, val, "diff");
 
     if (ckp->remote)
         upstream_json_msgtype(ckp, val, SM_BLOCK);
@@ -4772,7 +4777,8 @@ static void block_solve(pool_t *ckp, json_t *val)
 
     free(workername);
 
-    block_share_summary(sdata);
+    /* Print block share summary with values safely stored on the stack */
+    block_share_summary(sdata, solved_shares, solved_net_diff, solved_effort);
     reset_bestshares(sdata);
 }
 
@@ -7388,6 +7394,11 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         }
         json_decref(blockval);
         dealloc(fname);
+        /* Pass the parameters of the solved block to val_copy for block_solve */
+        json_set_int64(val_copy, "shares", shares);
+        json_set_double(val_copy, "network_difficulty", wb->network_diff);
+        json_set_double(val_copy, "diff", percent);
+
         block_solve(ckp, val_copy);
     } else {
         /* Record rejected block to disk so it is not lost */
@@ -8759,7 +8770,10 @@ static void parse_remote_block(pool_t *ckp, sdata_t *sdata, json_t *val, const c
          * responses, so only use this response to determine if we
          * should reset the best shares. */
         if (local_block_submit(ckp, gbt_block, gbt_block_len, flip32, wb->height)) {
-            block_share_summary(sdata);
+            int64_t rem_shares = sdata->stats.accounted_diff_shares;
+            double rem_netdiff = wb ? wb->diff : (double)sdata->stats.network_diff;
+            double rem_effort = (rem_netdiff > 0.0) ? ((double)rem_shares * 100.0 / rem_netdiff) : 0.0;
+            block_share_summary(sdata, rem_shares, rem_netdiff, rem_effort);
             reset_bestshares(sdata);
         }
         put_remote_workbase(sdata, wb);
@@ -10189,7 +10203,7 @@ static void *statsupdate(void *arg)
     while (42) {
         double ghs, ghs1, ghs5, ghs15, ghs60, ghs360, ghs1440, ghs10080,
             per_tdiff, hmul = 1, lmul = 1, rolling_herp, rolling_lns,
-            reward, derp, percent, net_diff = 0.0;
+            reward, derp, percent, exact_net_diff = 0.0;
         char suffix1[16], suffix5[16], suffix15[16], suffix60[16], suffix240[16], cdfield[64];
         char suffix360[16], suffix1440[16], suffix10080[16];
         char pcstring[32];
@@ -10244,8 +10258,15 @@ static void *statsupdate(void *arg)
         stats->rolling_lns += lns;
         rolling_lns = stats->rolling_lns;
         reward = stats->reward;
-        net_diff = (double)stats->network_diff;
         mutex_unlock(&sdata->stats_lock);
+
+        /* Obtain exact floating-point network diff once per cycle for accurate user and pool diff calculations */
+        ck_rlock(&sdata->workbase_lock);
+        if (sdata->current_workbase)
+            exact_net_diff = sdata->current_workbase->network_diff;
+        ck_runlock(&sdata->workbase_lock);
+        if (exact_net_diff <= 0.0)
+            exact_net_diff = (double)stats->network_diff;
 
         ck_wlock(&sdata->instance_lock);
         /* Grab the first entry */
@@ -10400,23 +10421,24 @@ static void *statsupdate(void *arg)
                 if (per_tdiff > 600)
                     inactive = true;
             }
-               	ghs = user->dsps1 * nonces;
-            	hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
-            
-            	ghs = user->dsps5 * nonces;
-            	hashrate_to_str2(ghs, suffix5, sizeof(suffix5));
-            
-            	ghs = user->dsps60 * nonces;
-            	hashrate_to_str2(ghs, suffix60, sizeof(suffix60));
 
-            	ghs = user->dsps240 * nonces;
-            	hashrate_to_str2(ghs, suffix240, sizeof(suffix240));
-            
-            	ghs = user->dsps1440 * nonces;
-            	hashrate_to_str2(ghs, suffix1440, sizeof(suffix1440));
-            
-            	ghs = user->dsps10080 * nonces;
-            	hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
+            ghs = user->dsps1 * nonces;
+            hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
+
+            ghs = user->dsps5 * nonces;
+            hashrate_to_str2(ghs, suffix5, sizeof(suffix5));
+
+            ghs = user->dsps60 * nonces;
+            hashrate_to_str2(ghs, suffix60, sizeof(suffix60));
+
+            ghs = user->dsps240 * nonces;
+            hashrate_to_str2(ghs, suffix240, sizeof(suffix240));
+
+            ghs = user->dsps1440 * nonces;
+            hashrate_to_str2(ghs, suffix1440, sizeof(suffix1440));
+
+            ghs = user->dsps10080 * nonces;
+            hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
             mutex_lock(&user->stats_lock);
             if (hmul != 1)
@@ -10438,9 +10460,9 @@ static void *statsupdate(void *arg)
             else
                 rj_ratio = 0.0;
 
-            /* Calculate round share diff ratio vs BCH network diff */
-            if (net_diff > 0.0)
-                user_diff = ((double)u_accepted * 100.0) / net_diff;
+            /* Calculate round share diff ratio vs BCH network diff using exact float difficulty */
+            if (exact_net_diff > 0.0)
+                user_diff = ((double)u_accepted * 100.0) / exact_net_diff;
             else
                 user_diff = 0.0;
 
@@ -10582,17 +10604,11 @@ static void *statsupdate(void *arg)
         }
 
         hashrate_to_str2(stats_copy->dsps1 * nonces, suffix1, sizeof(suffix1));
-        
         hashrate_to_str2(stats_copy->dsps5 * nonces, suffix5, sizeof(suffix5));
-        
         hashrate_to_str2(stats_copy->dsps15 * nonces, suffix15, sizeof(suffix15));
-        
         hashrate_to_str2(stats_copy->dsps60 * nonces, suffix60, sizeof(suffix60));
-        
         hashrate_to_str2(stats_copy->dsps360 * nonces, suffix360, sizeof(suffix360));
-        
         hashrate_to_str2(stats_copy->dsps1440 * nonces, suffix1440, sizeof(suffix1440));
-        
         hashrate_to_str2(stats_copy->dsps10080 * nonces, suffix10080, sizeof(suffix10080));
 
         ASPRINTF(&fname, "%s/pool/pool.status", ckp->logdir);
@@ -10627,7 +10643,7 @@ static void *statsupdate(void *arg)
         LOGNOTICE("Pool:%s", s);
         if (likely(fp)) fprintf(fp, "%s\n", s);
         
-         /* Pool hashrate history record*/
+        /* Pool hashrate history record */
         char hrfile[512], hr_stamp[128];
         get_timestamp(hr_stamp, sizeof(hr_stamp), ckp->localtime_logging);
         snprintf(hrfile, sizeof(hrfile) - 1, "%s/history/hashrate/pool.hashrate", ckp->logdir);
@@ -10650,19 +10666,19 @@ static void *statsupdate(void *arg)
         if (likely(fp)) fprintf(fp, "%s\n", s);
         dealloc(s);
 
-/* We should not divide by 0 here. */
-if (stats_copy->network_diff > 0)
-            percent = (double)stats_copy->accounted_diff_shares * 100.0 / (double)stats_copy->network_diff;
+        /* Calculate pool-wide effort ratio using exact network diff without integer truncation */
+        if (exact_net_diff > 0.0)
+            percent = (double)stats_copy->accounted_diff_shares * 100.0 / exact_net_diff;
         else
             percent = 0.0;
-        snprintf(pcstring, 31, "%.2f", percent);
+        snprintf(pcstring, sizeof(pcstring), "%.2f", percent);
 
         /* Calculation of the pool rejection rate with protection against division by 0. */
         double pool_rj = 0.0;
         char pool_rj_str[32];
         int64_t pool_total = stats_copy->accounted_diff_shares + stats_copy->accounted_rejects;
-		if (pool_total > 0)
-    	pool_rj = ((double)stats_copy->accounted_rejects * 100.0) / (double)pool_total;
+        if (pool_total > 0)
+            pool_rj = ((double)stats_copy->accounted_rejects * 100.0) / (double)pool_total;
         snprintf(pool_rj_str, sizeof(pool_rj_str), "%.4f", pool_rj);
 
         JSON_CPACK(val, "{ss,sI,sI,ss,sf,sf,sf,sf,sf}",
