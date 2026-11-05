@@ -280,6 +280,10 @@ struct worker_instance {
     double best_diff_alltime; /* Best share found by this worker (persistent) */
     int mindiff; /* User chosen mindiff */
 
+    /* Difficulty rule metadata: "md", "d", "mindiff_overrides", "vardiff" */
+    char diffrule[32];
+    int64_t diffvalue;
+
     bool idle;
     bool notified_idle;
 };
@@ -380,6 +384,7 @@ struct stratum_instance {
     /* Manual difficulty flags (per-session state) */
     bool fixed_diff;    /* True if md= fixed diff set via password field; disables vardiff */
     bool password_diff; /* True if d= or md= was set via password field; ignore useragent/suggest overrides */
+    bool mindiff_override;  /* True if matched mindiff_overrides from config */
 
     sdata_t *sdata; /* Which sdata this client is bound to */
     proxy_t *proxy; /* Proxy this is bound to in proxy mode */
@@ -4612,11 +4617,94 @@ static user_instance_t *user_by_workername(sdata_t *sdata, const char *workernam
 
 static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, const char *workername);
 
-static json_t *worker_stats(const worker_instance_t *worker)
+/* Helper to collect active connections, unique IPs, unique User-Agents, and diff rules */
+static void get_worker_runtime_meta(sdata_t *sdata, const worker_instance_t *worker,
+                                    int *conns_out, json_t **ua_arr_out, json_t **ip_arr_out,
+                                    const char **drule_out, int64_t *dval_out, bool lock_held)
+{
+    user_instance_t *user = worker->user_instance;
+    json_t *ua_arr = json_array();
+    json_t *ip_arr = json_array();
+    int conns = 0;
+    const char *drule = worker->diffrule[0] ? worker->diffrule : "vardiff";
+    int64_t dval = worker->diffvalue > 0 ? worker->diffvalue : (worker->mindiff ? worker->mindiff : sdata->ckp->startdiff);
+
+    if (!lock_held)
+        ck_rlock(&sdata->instance_lock);
+
+    if (user) {
+        stratum_instance_t *client;
+        DL_FOREACH2(user->clients, client, user_next) {
+            if (client->worker_instance != worker)
+                continue;
+            if (!client_active(client))
+                continue;
+
+            conns++;
+
+            /* Collect unique IP address */
+            if (client->address[0]) {
+                bool found_ip = false;
+                size_t idx;
+                json_t *item;
+                json_array_foreach(ip_arr, idx, item) {
+                    if (!strcmp(json_string_value(item), client->address)) {
+                        found_ip = true;
+                        break;
+                    }
+                }
+                if (!found_ip)
+                    json_array_append_new(ip_arr, json_string(client->address));
+            }
+
+            /* Collect unique User-Agent */
+            const char *uagent = (client->useragent && *client->useragent) ? client->useragent : "unknown";
+            bool found_ua = false;
+            size_t idx;
+            json_t *item;
+            json_array_foreach(ua_arr, idx, item) {
+                if (!strcmp(json_string_value(item), uagent)) {
+                    found_ua = true;
+                    break;
+                }
+            }
+            if (!found_ua)
+                json_array_append_new(ua_arr, json_string(uagent));
+
+            /* Extract live difficulty and rule from active client */
+            dval = client->diff;
+            if (client->fixed_diff)
+                drule = "md";
+            else if (client->password_diff)
+                drule = "d";
+            else if (client->mindiff_override)
+                drule = "mindiff_overrides";
+            else
+                drule = "vardiff";
+        }
+    }
+
+    if (!lock_held)
+        ck_runlock(&sdata->instance_lock);
+
+    *conns_out = conns;
+    *ua_arr_out = ua_arr;
+    *ip_arr_out = ip_arr;
+    *drule_out = drule;
+    *dval_out = dval;
+}
+
+static json_t *worker_stats(sdata_t *sdata, const worker_instance_t *worker)
 {
     char suffix1[16], suffix5[16], suffix60[16], suffix240[16], suffix1440[16], suffix10080[16];
-    json_t *val;
+    int conns = 0;
+    json_t *ua_arr = NULL, *ip_arr = NULL, *val = NULL;
+    const char *drule = "vardiff";
+    int64_t dval = 0;
     double ghs;
+
+    /* Collect runtime metadata (lock is already held in caller block_solve) */
+    get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval, true);
 
     ghs = worker->dsps1 * nonces;
     hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
@@ -4636,7 +4724,13 @@ static json_t *worker_stats(const worker_instance_t *worker)
     ghs = worker->dsps10080 * nonces;
     hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
-    JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss}",
+    JSON_CPACK(val, "{ss,si,so,so,ss,sI,ss,ss,ss,ss,ss,ss}",
+            "workername", worker->workername,
+            "connections", conns,
+            "useragent", ua_arr,
+            "ipaddress", ip_arr,
+            "diffrule", drule,
+            "diffvalue", (json_int_t)dval,
             "hashrate1m", suffix1,
             "hashrate5m", suffix5,
             "hashrate1hr", suffix60,
@@ -4774,7 +4868,7 @@ static void block_solve(pool_t *ckp, json_t *val)
 
         ck_rlock(&sdata->instance_lock);
         user_val = user_stats(user);
-        worker_val = worker_stats(worker);
+        worker_val = worker_stats(sdata, worker);
         ck_runlock(&sdata->instance_lock);
 
         s = json_dumps(user_val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
@@ -6210,6 +6304,7 @@ static void client_apply_mindiff_override(stratum_instance_t *client)
             // match, apply suggested_diff to client, which will clamp
             // the minimum difficulty for this client for all workers to be >= ovr->mindiff
             client->suggest_diff = client->old_diff = client->diff = ovr->mindiff;
+            client->mindiff_override = true;
             LOGDEBUG("mindiff_overrides: Applied minimum & starting difficulty = %"PRId64" to client %"PRId64" matching"
                      " \"%s\"", ovr->mindiff, client->id, ovr->useragent);
             return;
@@ -6287,6 +6382,7 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
                 nicehash_diff = ckp->mindiff;
             if (ckp->maxdiff && nicehash_diff > ckp->maxdiff)
                 nicehash_diff = ckp->maxdiff;
+            client->mindiff_override = true;
             client->suggest_diff = client->diff = client->old_diff = nicehash_diff;
             LOGNOTICE("NiceHash detected from useragent '%s' for client %"PRId64", applied difficulty %"PRId64,
                       client->useragent, client_id, nicehash_diff);
@@ -6296,6 +6392,7 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
                 mrr_diff = ckp->mindiff;
             if (ckp->maxdiff && mrr_diff > ckp->maxdiff)
                 mrr_diff = ckp->maxdiff;
+            client->mindiff_override = true;
             client->suggest_diff = client->diff = client->old_diff = mrr_diff;
             LOGNOTICE("MiningRigRentals detected from useragent '%s' for client %"PRId64", applied difficulty %"PRId64,
                       client->useragent, client_id, mrr_diff);
@@ -6601,6 +6698,18 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
             json_get_int64(&worker->shares, arr_val, "shares");
             json_get_double(&worker->herp, arr_val, "herp");
             json_get_double(&worker->lns, arr_val, "lns");
+            /* Restore diffrule and diffvalue if present */
+            const char *dr_str = json_string_value(json_object_get(arr_val, "diffrule"));
+            if (dr_str)
+                strncpy(worker->diffrule, dr_str, sizeof(worker->diffrule) - 1);
+            else
+                strncpy(worker->diffrule, "vardiff", sizeof(worker->diffrule) - 1);
+
+            int64_t dv_val = 0;
+            if (json_get_int64(&dv_val, arr_val, "diffvalue") && dv_val > 0)
+                worker->diffvalue = dv_val;
+            else
+                worker->diffvalue = ckp->startdiff;
             if (worker->best_diff > worker->best_diff_alltime) {
                 // migrate
                 worker->best_diff_alltime = worker->best_diff;
@@ -6960,6 +7069,11 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
             client->diff_change_job_id = client->sdata->workbase_id + 1;
             client->old_diff = client->diff;
             client->diff = req_fixeddiff;
+
+            /* Set worker difficulty rule metadata */
+            strncpy(client->worker_instance->diffrule, "md", sizeof(client->worker_instance->diffrule) - 1);
+            client->worker_instance->diffvalue = req_fixeddiff;
+
             LOGNOTICE("Client %"PRId64" worker %s set fixed diff %"PRId64" from password field",
                       client->id, buf, req_fixeddiff);
         } else if (req_mindiff > 0) {
@@ -6974,11 +7088,25 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
             client->diff_change_job_id = client->sdata->workbase_id + 1;
             client->old_diff = client->diff;
             client->diff = req_mindiff;
+
+            /* Set worker difficulty rule metadata */
+            strncpy(client->worker_instance->diffrule, "d", sizeof(client->worker_instance->diffrule) - 1);
+            client->worker_instance->diffvalue = req_mindiff;
+
             LOGNOTICE("Client %"PRId64" worker %s set mindiff/startdiff %"PRId64" from password field",
                       client->id, buf, req_mindiff);
         } else {
             client->fixed_diff = false;
             client->password_diff = false;
+
+            /* Set worker difficulty rule: mindiff_overrides or default vardiff */
+            if (client->mindiff_override) {
+                strncpy(client->worker_instance->diffrule, "mindiff_overrides", sizeof(client->worker_instance->diffrule) - 1);
+                client->worker_instance->diffvalue = client->diff;
+            } else {
+                strncpy(client->worker_instance->diffrule, "vardiff", sizeof(client->worker_instance->diffrule) - 1);
+                client->worker_instance->diffvalue = client->diff;
+            }
         }
     }
 
@@ -7237,6 +7365,7 @@ static void add_submit(pool_t *ckp, stratum_instance_t *client, double sdiff,
     client->diff_change_job_id = next_blockid;
     client->old_diff = client->diff;
     client->diff = optimal;
+    worker->diffvalue = optimal; /* Keep worker metadata diff up to date */
     stratum_send_diff(sdata, client);
 }
 
@@ -10412,12 +10541,25 @@ static void *statsupdate(void *arg)
 
                 LOGDEBUG("Storing worker %s", worker->workername);
 
+                /* Collect runtime connection metadata, IPs, User-Agents, and diff rules */
+                int conns = 0;
+                json_t *ua_arr = NULL, *ip_arr = NULL;
+                const char *drule = "vardiff";
+                int64_t dval = 0;
+                get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval, false);
+
                 if (fabs(worker->lns) > 0.)
                     percent = round(worker->herp / worker->lns * 100) / 100;
                 else
                     percent = 1.0;
-                JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
+
+                JSON_CPACK(val, "{ss,si,so,so,ss,sI,ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
                            "workername", worker->workername,
+                           "connections", conns,
+                           "useragent", ua_arr,
+                           "ipaddress", ip_arr,
+                           "diffrule", drule,
+                           "diffvalue", (json_int_t)dval,
                            "hashrate1m", suffix1,
                            "hashrate5m", suffix5,
                            "hashrate1hr", suffix60,
