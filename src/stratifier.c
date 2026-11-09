@@ -13,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -72,6 +73,7 @@ typedef struct user_instance user_instance_t;
 typedef struct worker_instance worker_instance_t;
 typedef struct stratum_instance stratum_instance_t;
 static void hashrate_to_str2(double val, char *buf, size_t bufsiz);
+static void format_timetoblock(uint64_t seconds, char *buf, size_t buflen);
 
 struct generation {
     UT_hash_handle hh;
@@ -4617,10 +4619,125 @@ static user_instance_t *user_by_workername(sdata_t *sdata, const char *workernam
 
 static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, const char *workername);
 
-/* Helper to collect active connections, unique IPs, unique User-Agents, and diff rules */
+/* Extended Linux TCP_INFO layout to extract the true physical minrtt */
+struct tcp_info_full {
+    uint8_t   tcpi_state;
+    uint8_t   tcpi_ca_state;
+    uint8_t   tcpi_retransmits;
+    uint8_t   tcpi_probes;
+    uint8_t   tcpi_backoff;
+    uint8_t   tcpi_options;
+    uint8_t   tcpi_snd_wscale : 4, tcpi_rcv_wscale : 4;
+    uint8_t   tcpi_delivery_rate_app_limited:1;
+
+    uint32_t  tcpi_rto;
+    uint32_t  tcpi_ato;
+    uint32_t  tcpi_snd_mss;
+    uint32_t  tcpi_rcv_mss;
+
+    uint32_t  tcpi_unacked;
+    uint32_t  tcpi_sacked;
+    uint32_t  tcpi_lost;
+    uint32_t  tcpi_retrans;
+    uint32_t  tcpi_fackets;
+
+    uint32_t  tcpi_last_data_sent;
+    uint32_t  tcpi_last_data_recv;
+    uint32_t  tcpi_last_ack_recv;
+
+    uint32_t  tcpi_pmtu;
+    uint32_t  tcpi_rcv_ssthresh;
+    uint32_t  tcpi_rtt;
+    uint32_t  tcpi_rttvar;
+    uint32_t  tcpi_snd_ssthresh;
+    uint32_t  tcpi_snd_cwnd;
+    uint32_t  tcpi_advmss;
+    uint32_t  tcpi_reordering;
+
+    uint32_t  tcpi_rcv_rtt;
+    uint32_t  tcpi_rcv_space;
+
+    uint32_t  tcpi_total_retrans;
+
+    uint64_t  tcpi_pacing_rate;
+    uint64_t  tcpi_max_pacing_rate;
+    uint64_t  tcpi_bytes_acked;
+    uint64_t  tcpi_bytes_received;
+    uint32_t  tcpi_segs_out;
+    uint32_t  tcpi_segs_in;
+
+    uint32_t  tcpi_notsent_bytes;
+    uint32_t  tcpi_min_rtt; /* That exact minrtt field from 'ss'! */
+};
+
+/* Query Linux kernel TCP_INFO for exact physical RTT ping */
+static double get_ip_kernel_ping(const char *ip_address)
+{
+    if (!ip_address || !*ip_address)
+        return 0.0;
+
+    DIR *d = opendir("/proc/self/fd");
+    if (!d)
+        return 0.0;
+
+    struct dirent *de;
+    double total_rtt = 0.0;
+    int count = 0;
+
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        int fd = atoi(de->d_name);
+        if (fd < 3)
+            continue;
+
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        if (getpeername(fd, (struct sockaddr *)&ss, &slen) == 0) {
+            char peer_ip[INET6_ADDRSTRLEN] = {0};
+            if (ss.ss_family == AF_INET) {
+                struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+                inet_ntop(AF_INET, &s4->sin_addr, peer_ip, sizeof(peer_ip));
+            } else if (ss.ss_family == AF_INET6) {
+                struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+                inet_ntop(AF_INET6, &s6->sin6_addr, peer_ip, sizeof(peer_ip));
+            }
+
+            if (!strcmp(peer_ip, ip_address)) {
+                struct tcp_info_full kinfo;
+                memset(&kinfo, 0, sizeof(kinfo));
+                socklen_t tlen = sizeof(kinfo);
+
+                if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &kinfo, &tlen) == 0) {
+                    /* Extract exact physical minrtt (in microseconds) */
+                    uint32_t rtt_us = 0;
+                    if (tlen >= sizeof(kinfo) && kinfo.tcpi_min_rtt > 0)
+                        rtt_us = kinfo.tcpi_min_rtt;
+                    else if (kinfo.tcpi_rtt > 0)
+                        rtt_us = kinfo.tcpi_rtt;
+
+                    if (rtt_us > 0) {
+                        total_rtt += (double)rtt_us / 1000.0;
+                        count++;
+                    }
+                }
+            }
+        }
+    }
+    closedir(d);
+
+    if (count > 0)
+        return round((total_rtt / (double)count) * 100.0) / 100.0;
+    return 0.0;
+}
+
+/* Helper to collect active connections, unique IPs, unique User-Agents, diff rules, kernel ping, and uptime */
 static void get_worker_runtime_meta(sdata_t *sdata, const worker_instance_t *worker,
                                     int *conns_out, json_t **ua_arr_out, json_t **ip_arr_out,
-                                    const char **drule_out, int64_t *dval_out, bool lock_held)
+                                    const char **drule_out, int64_t *dval_out,
+                                    double *ping_ms_out, int64_t *uptime_unix_out,
+                                    char *uptime_human_out, size_t uptime_human_sz,
+                                    bool lock_held)
 {
     user_instance_t *user = worker->user_instance;
     json_t *ua_arr = json_array();
@@ -4628,6 +4745,7 @@ static void get_worker_runtime_meta(sdata_t *sdata, const worker_instance_t *wor
     int conns = 0;
     const char *drule = worker->diffrule[0] ? worker->diffrule : "vardiff";
     int64_t dval = worker->diffvalue > 0 ? worker->diffvalue : (worker->mindiff ? worker->mindiff : sdata->ckp->startdiff);
+    time_t earliest_start = 0;
 
     if (!lock_held)
         ck_rlock(&sdata->instance_lock);
@@ -4641,6 +4759,10 @@ static void get_worker_runtime_meta(sdata_t *sdata, const worker_instance_t *wor
                 continue;
 
             conns++;
+
+            /* Track earliest session start time for active connections */
+            if (earliest_start == 0 || client->start_time < earliest_start)
+                earliest_start = client->start_time;
 
             /* Collect unique IP address */
             if (client->address[0]) {
@@ -4687,11 +4809,36 @@ static void get_worker_runtime_meta(sdata_t *sdata, const worker_instance_t *wor
     if (!lock_held)
         ck_runlock(&sdata->instance_lock);
 
+    /* 1. Calculate session uptime */
+    int64_t uptime_unix = 0;
+    if (conns > 0 && earliest_start > 0) {
+        time_t now_sec = time(NULL);
+        uptime_unix = (int64_t)(now_sec - earliest_start);
+    }
+    format_timetoblock((uint64_t)uptime_unix, uptime_human_out, uptime_human_sz);
+
+    /* 2. Calculate average kernel TCP RTT ping across unique connected IPs */
+    double total_ping = 0.0;
+    int ping_count = 0;
+    size_t ip_idx;
+    json_t *ip_item;
+    json_array_foreach(ip_arr, ip_idx, ip_item) {
+        const char *ip_str = json_string_value(ip_item);
+        double p = get_ip_kernel_ping(ip_str);
+        if (p > 0.0) {
+            total_ping += p;
+            ping_count++;
+        }
+    }
+    double avg_ping = (ping_count > 0) ? (round((total_ping / ping_count) * 100.0) / 100.0) : 0.0;
+
     *conns_out = conns;
     *ua_arr_out = ua_arr;
     *ip_arr_out = ip_arr;
     *drule_out = drule;
     *dval_out = dval;
+    *ping_ms_out = avg_ping;
+    *uptime_unix_out = uptime_unix;
 }
 
 static json_t *worker_stats(sdata_t *sdata, const worker_instance_t *worker)
@@ -4701,10 +4848,14 @@ static json_t *worker_stats(sdata_t *sdata, const worker_instance_t *worker)
     json_t *ua_arr = NULL, *ip_arr = NULL, *val = NULL;
     const char *drule = "vardiff";
     int64_t dval = 0;
+    double ping_ms = 0.0;
+    int64_t uptime_unix = 0;
+    char uptime_human[64] = "0s";
     double ghs;
 
     /* Collect runtime metadata (lock is already held in caller block_solve) */
-    get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval, true);
+    get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval,
+                            &ping_ms, &uptime_unix, uptime_human, sizeof(uptime_human), true);
 
     ghs = worker->dsps1 * nonces;
     hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
@@ -4724,13 +4875,16 @@ static json_t *worker_stats(sdata_t *sdata, const worker_instance_t *worker)
     ghs = worker->dsps10080 * nonces;
     hashrate_to_str2(ghs, suffix10080, sizeof(suffix10080));
 
-    JSON_CPACK(val, "{ss,si,so,so,ss,sI,ss,ss,ss,ss,ss,ss}",
+    JSON_CPACK(val, "{ss,si,so,so,ss,sI,sf,sI,ss,ss,ss,ss,ss,ss,ss}",
             "workername", worker->workername,
             "connections", conns,
             "useragent", ua_arr,
             "ipaddress", ip_arr,
             "diffrule", drule,
             "diffvalue", (json_int_t)dval,
+            "ping_ms", ping_ms,
+            "session_uptime_unix", (json_int_t)uptime_unix,
+            "session_uptime_human", uptime_human,
             "hashrate1m", suffix1,
             "hashrate5m", suffix5,
             "hashrate1hr", suffix60,
@@ -10541,25 +10695,33 @@ static void *statsupdate(void *arg)
 
                 LOGDEBUG("Storing worker %s", worker->workername);
 
-                /* Collect runtime connection metadata, IPs, User-Agents, and diff rules */
+                /* Collect runtime connection metadata, IPs, User-Agents, diff rules, ping, and uptime */
                 int conns = 0;
                 json_t *ua_arr = NULL, *ip_arr = NULL;
                 const char *drule = "vardiff";
                 int64_t dval = 0;
-                get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval, false);
+                double ping_ms = 0.0;
+                int64_t uptime_unix = 0;
+                char uptime_human[64] = "0s";
+
+                get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval,
+                                        &ping_ms, &uptime_unix, uptime_human, sizeof(uptime_human), false);
 
                 if (fabs(worker->lns) > 0.)
                     percent = round(worker->herp / worker->lns * 100) / 100;
                 else
                     percent = 1.0;
 
-                JSON_CPACK(val, "{ss,si,so,so,ss,sI,ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
+                JSON_CPACK(val, "{ss,si,so,so,ss,sI,sf,sI,ss,ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
                            "workername", worker->workername,
                            "connections", conns,
                            "useragent", ua_arr,
                            "ipaddress", ip_arr,
                            "diffrule", drule,
                            "diffvalue", (json_int_t)dval,
+                           "ping_ms", ping_ms,
+                           "session_uptime_unix", (json_int_t)uptime_unix,
+                           "session_uptime_human", uptime_human,
                            "hashrate1m", suffix1,
                            "hashrate5m", suffix5,
                            "hashrate1hr", suffix60,
