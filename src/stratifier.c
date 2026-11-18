@@ -3082,7 +3082,7 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
     uint32_t ntime32, version_mask = 0;
     char blockhash[68], cdfield[64];
     json_t *bval, *bval_copy;
-    int enonce1len, cblen;
+    int enonce1len, cblen = 0;
     workbase_t *wb = NULL;
     double diff;
     ts_t ts_now;
@@ -3132,12 +3132,18 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
 
     /* Get parameters if upstream pool supports them with new format */
     json_get_string(&coinbasehex, val, "coinbasehex");
-    json_get_int(&cblen, val, "cblen"); // TODO: enforce 1MB coinbase tx length here?
+    json_get_int(&cblen, val, "cblen");
     json_get_string(&swaphex, val, "swaphex");
     if (coinbasehex && cblen && swaphex) {
         uchar hash1[32];
 
-        coinbase = alloca(cblen);
+        /* Enforce 1MB coinbase tx length limit and allocate on heap to prevent stack overflow */
+        if (unlikely(cblen <= 0 || cblen > MAX_COINBASE_TX_LEN)) {
+            LOGWARNING("Invalid cblen %d in submit_node_block", cblen);
+            put_workbase(sdata, wb);
+            goto out;
+        }
+        coinbase = ckalloc(cblen);
         hex2bin(coinbase, coinbasehex, cblen);
         hex2bin(swap, swaphex, 80);
         sha256(swap, 80, hash1);
@@ -3146,14 +3152,18 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
         /* Rebuild the old way if we can if the upstream pool is using
          * the old format only */
         enonce1len = wb->enonce1constlen + wb->enonce1varlen;
-        enonce1bin = alloca(enonce1len);
+        const int max_cb_len = wb->coinb1len + enonce1len + wb->enonce2varlen + wb->coinb2len;
+        if (unlikely(enonce1len <= 0 || max_cb_len <= 0 || max_cb_len > MAX_COINBASE_TX_LEN)) {
+            LOGWARNING("Invalid reconstructed coinbase length %d in submit_node_block", max_cb_len);
+            put_workbase(sdata, wb);
+            goto out;
+        }
+        enonce1bin = ckalloc(enonce1len);
         hex2bin(enonce1bin, enonce1, enonce1len);
-        coinbase = alloca(wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len);
+        coinbase = ckalloc(max_cb_len);
         /* Fill in the hashes */
         share_diff(NULL, coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
     }
-
-    // TODO: Enforce 32MB block size limit here?
 
     /* Now we have enough to assemble a block */
     gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash, &gbt_block_len);
@@ -3183,6 +3193,8 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
     else
         block_reject(bval_copy);
 out:
+    free(coinbase);
+    free(enonce1bin);
     free(nonce2);
     free(nonce);
     free(enonce1);
@@ -3754,7 +3766,7 @@ static void update_subscribe(pool_t *ckp, const char *cmd)
     sdata_t *sdata = ckp->sdata, *dsdata;
     int id = 0, subid = 0, userid = 0;
     proxy_t *proxy, *old = NULL;
-    const char *buf;
+    const char *buf, *baseurl, *url, *auth, *pass, *enonce1;
     bool global;
     json_t *val;
 
@@ -3771,21 +3783,36 @@ static void update_subscribe(pool_t *ckp, const char *cmd)
     }
     if (unlikely(!json_get_int(&id, val, "proxy"))) {
         LOGWARNING("Failed to json decode proxy value in update_subscribe %s", buf);
+        json_decref(val);
         return;
     }
     if (unlikely(!json_get_int(&subid, val, "subproxy"))) {
         LOGWARNING("Failed to json decode subproxy value in update_subscribe %s", buf);
+        json_decref(val);
         return;
     }
     if (unlikely(!json_get_bool(&global, val, "global"))) {
         LOGWARNING("Failed to json decode global value in update_subscribe %s", buf);
+        json_decref(val);
         return;
     }
     if (!global) {
         if (unlikely(!json_get_int(&userid, val, "userid"))) {
             LOGWARNING("Failed to json decode userid value in update_subscribe %s", buf);
+            json_decref(val);
             return;
         }
+    }
+
+    baseurl = json_string_value(json_object_get(val, "baseurl"));
+    url = json_string_value(json_object_get(val, "url"));
+    auth = json_string_value(json_object_get(val, "auth"));
+    pass = json_string_value(json_object_get(val, "pass"));
+    enonce1 = json_string_value(json_object_get(val, "enonce1"));
+    if (unlikely(!baseurl || !url || !auth || !pass || !enonce1)) {
+        LOGWARNING("Missing required string fields in update_subscribe %s", buf);
+        json_decref(val);
+        return;
     }
 
     if (!subid)
@@ -3809,16 +3836,17 @@ static void update_subscribe(pool_t *ckp, const char *cmd)
     memset(proxy->url, 0, 128);
     memset(proxy->auth, 0, 128);
     memset(proxy->pass, 0, 128);
-    strncpy(proxy->baseurl, json_string_value(json_object_get(val, "baseurl")), 127);
-    strncpy(proxy->url, json_string_value(json_object_get(val, "url")), 127);
-    strncpy(proxy->auth, json_string_value(json_object_get(val, "auth")), 127);
-    strncpy(proxy->pass, json_string_value(json_object_get(val, "pass")), 127);
+    strncpy(proxy->baseurl, baseurl, 127);
+    strncpy(proxy->url, url, 127);
+    strncpy(proxy->auth, auth, 127);
+    strncpy(proxy->pass, pass, 127);
 
     dsdata = proxy->sdata;
 
     ck_wlock(&dsdata->workbase_lock);
     /* Length is checked by generator */
-    strcpy(proxy->enonce1, json_string_value(json_object_get(val, "enonce1")));
+    strncpy(proxy->enonce1, enonce1, sizeof(proxy->enonce1) - 1);
+    proxy->enonce1[sizeof(proxy->enonce1) - 1] = 0;
     proxy->enonce1constlen = strlen(proxy->enonce1) / 2;
     hex2bin(proxy->enonce1bin, proxy->enonce1, proxy->enonce1constlen);
     proxy->nonce2len = json_integer_value(json_object_get(val, "nonce2len"));
@@ -4670,7 +4698,7 @@ struct tcp_info_full {
     uint32_t  tcpi_min_rtt; /* That exact minrtt field from 'ss'! */
 };
 
-/* Query Linux kernel TCP_INFO for exact physical RTT ping */
+/* Query Linux kernel TCP_INFO for exact physical min_rtt ping */
 static double get_ip_kernel_ping(const char *ip_address)
 {
     if (!ip_address || !*ip_address)
@@ -4693,34 +4721,42 @@ static double get_ip_kernel_ping(const char *ip_address)
 
         struct sockaddr_storage ss;
         socklen_t slen = sizeof(ss);
-        if (getpeername(fd, (struct sockaddr *)&ss, &slen) == 0) {
-            char peer_ip[INET6_ADDRSTRLEN] = {0};
-            if (ss.ss_family == AF_INET) {
-                struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
-                inet_ntop(AF_INET, &s4->sin_addr, peer_ip, sizeof(peer_ip));
-            } else if (ss.ss_family == AF_INET6) {
-                struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
-                inet_ntop(AF_INET6, &s6->sin6_addr, peer_ip, sizeof(peer_ip));
-            }
+        if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0)
+            continue;
 
-            if (!strcmp(peer_ip, ip_address)) {
-                struct tcp_info_full kinfo;
-                memset(&kinfo, 0, sizeof(kinfo));
-                socklen_t tlen = sizeof(kinfo);
+        char peer_ip[INET6_ADDRSTRLEN] = {0};
+        if (ss.ss_family == AF_INET) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+            inet_ntop(AF_INET, &s4->sin_addr, peer_ip, sizeof(peer_ip));
+        } else if (ss.ss_family == AF_INET6) {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+            inet_ntop(AF_INET6, &s6->sin6_addr, peer_ip, sizeof(peer_ip));
+        } else {
+            continue;
+        }
 
-                if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &kinfo, &tlen) == 0) {
-                    /* Extract exact physical minrtt (in microseconds) */
-                    uint32_t rtt_us = 0;
-                    if (tlen >= sizeof(kinfo) && kinfo.tcpi_min_rtt > 0)
-                        rtt_us = kinfo.tcpi_min_rtt;
-                    else if (kinfo.tcpi_rtt > 0)
-                        rtt_us = kinfo.tcpi_rtt;
+        if (strcmp(peer_ip, ip_address) != 0)
+            continue;
 
-                    if (rtt_us > 0) {
-                        total_rtt += (double)rtt_us / 1000.0;
-                        count++;
-                    }
-                }
+        struct tcp_info_full kinfo;
+        memset(&kinfo, 0, sizeof(kinfo));
+        socklen_t tlen = sizeof(kinfo);
+
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &kinfo, &tlen) == 0) {
+            /* Process only active ESTABLISHED TCP connections (state == 1) */
+            if (kinfo.tcpi_state != 1)
+                continue;
+
+            /* Use kernel windowed min_rtt to filter out Stratum Delayed-ACK pauses */
+            uint32_t rtt_us = 0;
+            if (tlen >= sizeof(kinfo) && kinfo.tcpi_min_rtt > 0)
+                rtt_us = kinfo.tcpi_min_rtt;
+            else if (kinfo.tcpi_rtt > 0)
+                rtt_us = kinfo.tcpi_rtt;
+
+            if (rtt_us > 0) {
+                total_rtt += (double)rtt_us / 1000.0;
+                count++;
             }
         }
     }
@@ -4853,9 +4889,9 @@ static json_t *worker_stats(sdata_t *sdata, const worker_instance_t *worker)
     char uptime_human[64] = "0s";
     double ghs;
 
-    /* Collect runtime metadata (lock is already held in caller block_solve) */
+    /* Collect runtime metadata (acquires instance_lock internally only for in-memory list traversal) */
     get_worker_runtime_meta(sdata, worker, &conns, &ua_arr, &ip_arr, &drule, &dval,
-                            &ping_ms, &uptime_unix, uptime_human, sizeof(uptime_human), true);
+                            &ping_ms, &uptime_unix, uptime_human, sizeof(uptime_human), false);
 
     ghs = worker->dsps1 * nonces;
     hashrate_to_str2(ghs, suffix1, sizeof(suffix1));
@@ -5022,8 +5058,10 @@ static void block_solve(pool_t *ckp, json_t *val)
 
         ck_rlock(&sdata->instance_lock);
         user_val = user_stats(user);
-        worker_val = worker_stats(sdata, worker);
         ck_runlock(&sdata->instance_lock);
+
+        /* Call worker_stats outside instance_lock so /proc/self/fd syscalls do not block the pool */
+        worker_val = worker_stats(sdata, worker);
 
         s = json_dumps(user_val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
         json_decref(user_val);
@@ -5813,6 +5851,7 @@ retry:
         LOGDEBUG("Stratifier received stats request");
         msg = stratifier_stats(ckp, sdata);
         send_unix_msg(umsg->sockd, msg);
+        free(msg);
         goto retry;
     }
     /* Parse API commands here to return a message to sockd */
@@ -9034,7 +9073,7 @@ static void parse_remote_block(pool_t *ckp, sdata_t *sdata, json_t *val, const c
     int height = 0;
     int64_t id = 0;
     char *msg;
-    int cblen;
+    int cblen = 0;
 
     name = json_string_value(name_val);
     if (!name_val || !name)
@@ -9051,14 +9090,14 @@ static void parse_remote_block(pool_t *ckp, sdata_t *sdata, json_t *val, const c
     json_get_int(&cblen, val, "cblen");
     json_get_double(&diff, val, "diff");
 
-    if (likely(id && coinbasehex && swaphex && cblen))
+    if (likely(id && coinbasehex && swaphex && cblen > 0 && cblen <= MAX_COINBASE_TX_LEN))
         wb = get_remote_workbase(sdata, id, client_id);
 
     if (unlikely(!wb))
         LOGWARNING("Inadequate data locally to attempt submit of remote block");
     else {
         uchar swap[80], hash[32], hash1[32], flip32[32];
-        char *coinbase = alloca(cblen), *gbt_block;
+        char *coinbase = ckalloc(cblen), *gbt_block;
         size_t gbt_block_len;
         char blockhash[68];
 
@@ -9068,6 +9107,7 @@ static void parse_remote_block(pool_t *ckp, sdata_t *sdata, json_t *val, const c
         sha256(swap, 80, hash1);
         sha256(hash1, 32, hash);
         gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash, &gbt_block_len);
+        free(coinbase);
         /* Note nodes use jobid of the mapped_id instead of workinfoid */
         json_set_int64(val, "jobid", wb->mapped_id);
         send_nodes_block(sdata, val, client_id);
@@ -10602,7 +10642,7 @@ static void *statsupdate(void *arg)
             } else {
                 per_tdiff = tvdiff(&now, &client->last_share);
                 /* Decay times per connected instance */
-                if (per_tdiff > 60) {
+                if (per_tdiff > 180) {
                     /* No shares for over a minute, decay to 0 */
                     decay_client(client, 0, &now);
                     idle_workers++;
@@ -10670,7 +10710,7 @@ static void *statsupdate(void *arg)
                     continue;
                 }
 
-                if (per_tdiff > 60) {
+                if (per_tdiff > 180) {
                     decay_worker(worker, 0, &now);
                     worker->idle = true;
                 }
@@ -10741,7 +10781,7 @@ static void *statsupdate(void *arg)
 
             /* Decay times per user */
             per_tdiff = tvdiff(&now, &user->last_share);
-            if (per_tdiff > 60) {
+            if (per_tdiff > 180) {
                 decay_user(user, 0, &now);
                 idle = true;
                 if (per_tdiff > 600)
