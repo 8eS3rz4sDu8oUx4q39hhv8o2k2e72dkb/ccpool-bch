@@ -1096,7 +1096,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
     strbuffer_append_bytes(strbuf, "\xff\xff\xff\xff", 4);
 
     // at this point strbuf (and cb1_buf) points to the tx.vout length field (compact size).
-    // reserve 3 bytes for this field.  Common case is we will have to move the data back by 2 bytes, however.
+    // reserve 3 bytes for this field. Common case is we will have to move the data back by 2 bytes, however.
     const int compact_size_pos = strbuf->length;
 #define compact_size_reserved 3
     {
@@ -1108,7 +1108,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 
     /* Add all the payout outputs (including pool fees and donations, if any, etc).
        In the rare case of leftover satoshis, they are guaranteed to go back to the pool
-       as a fallback.  The below call always succeeds if it returns. */
+       as a fallback. The below call always succeeds if it returns. */
     const uint64_t solo_amount = add_coinbase_payouts(ckp, wb, &cb1_buf);
 
     if (ckp->solo) {
@@ -1344,7 +1344,8 @@ static void ssend_bulk_append(sdata_t *sdata, ckmsg_t *bulk_send, const int mess
     mutex_lock(ssends->lock);
     ssends->messages += messages;
     DL_CONCAT(ssends->msgs, bulk_send);
-    pthread_cond_signal(ssends->cond);
+    /* Broadcast so thread 0 owning ssends->msgs wakes up immediately */
+    pthread_cond_broadcast(ssends->cond);
     mutex_unlock(ssends->lock);
 }
 
@@ -1360,7 +1361,8 @@ static void ssend_bulk_prepend(sdata_t *sdata, ckmsg_t *bulk_send, const int mes
     ssends->msgs = bulk_send;
     ssends->messages += messages;
     DL_CONCAT(ssends->msgs, tmp);
-    pthread_cond_signal(ssends->cond);
+    /* Broadcast so thread 0 owning ssends->msgs wakes up immediately */
+    pthread_cond_broadcast(ssends->cond);
     mutex_unlock(ssends->lock);
 }
 
@@ -1589,15 +1591,16 @@ static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
     ck_wunlock(&sdata->instance_lock);
 }
 
-/* Add a new workbase to the table of workbases. Sdata is the global data in
- * pool mode but unique to each subproxy in proxy mode */
-static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_block)
+/* Fast-path workbase registration in RAM. All disk I/O, share table purging,
+ * and old workbase aging are deferred to post_base_housekeeping() AFTER
+ * mining.notify has been broadcast to miners. */
+static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_block, bool *diff_changed)
 {
     sdata_t *ckp_sdata = ckp->sdata;
-    workbase_t *tmp, *tmpa;
-    int len, ret;
+    int len;
     const uchar *nbits;
 
+    *diff_changed = false;
     ts_realtime(&wb->gentime);
     nbits = (uchar *)(wb->headerbin + 72);
     wb->network_diff = diff_from_nbits(nbits);
@@ -1617,22 +1620,51 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
     len = strlen(ckp->logdir) + 8 + 1 + 16 + 1;
     wb->logdir = ckzalloc(len);
 
-    /* In proxy mode, the wb->id is received in the notify update and
-     * we set workbase_id from it. In server mode the stratifier is
-     * setting the workbase_id */
     ck_wlock(&sdata->workbase_lock);
     ckp_sdata->workbases_generated++;
     if (!ckp->proxy)
         wb->mapped_id = wb->id = sdata->workbase_id++;
     else
         sdata->workbase_id = wb->id;
+
     mutex_lock(&sdata->last_hash_lock);
     if (memcmp(nbits, sdata->lastBitsSeen, 4)) {
-        // Network difficulty change, log it to normal log
         memcpy(sdata->lastBitsSeen, nbits, 4);
-        LOGNOTICE("Network difficulty changed: %1.3f", wb->network_diff);
+        *diff_changed = true;
+    }
+    if (strncmp(wb->prevhash, sdata->lasthash, 64)) {
+        *new_block = true;
+        memcpy(sdata->lasthash, wb->prevhash, 65);
+        hex2bin(sdata->lasthashbin, sdata->lasthash, 32);
+        swap_256(sdata->lastswaphashbin, sdata->lasthashbin);
+        bin2hex__(sdata->lastswaphash, sdata->lastswaphashbin, 32);
+        sdata->blockchange_id = wb->id;
+    }
+    mutex_unlock(&sdata->last_hash_lock);
 
-        /* Network difficulty history entry */
+    sprintf(wb->idstring, "%016"PRIx64, wb->id);
+    if (ckp->logshares)
+        sprintf(wb->logdir, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
+
+    HASH_ADD_I64(sdata->workbases, id, wb);
+    if (sdata->current_workbase)
+        tv_time(&sdata->current_workbase->retired);
+    sdata->current_workbase = wb;
+    ck_wunlock(&sdata->workbase_lock);
+
+    /* Generate per-user coinb2 in RAM before solo broadcast */
+    if (ckp->solo)
+        generate_userwbs(sdata, wb);
+}
+
+/* Deferred housekeeping executed AFTER stratum mining.notify is already queued to miners */
+static void post_base_housekeeping(pool_t *ckp, sdata_t *sdata, workbase_t *wb,
+                                   const bool new_block, const bool diff_changed)
+{
+    workbase_t *tmp, *tmpa;
+
+    if (diff_changed) {
+        LOGNOTICE("Network difficulty changed: %1.3f", wb->network_diff);
         char dstamp[128], dfile[512];
         get_timestamp(dstamp, sizeof(dstamp), ckp->localtime_logging);
         snprintf(dfile, sizeof(dfile) - 1, "%s/history/difficulty/network.difficulty", ckp->logdir);
@@ -1642,34 +1674,16 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
             fclose(fp_diff);
         }
     }
-    if (strncmp(wb->prevhash, sdata->lasthash, 64)) {
-        *new_block = true;
-        // now copy the bin data and hexify it
-        memcpy(sdata->lasthash, wb->prevhash, 65);
-        hex2bin(sdata->lasthashbin, sdata->lasthash, 32);
-        swap_256(sdata->lastswaphashbin, sdata->lasthashbin);
-        bin2hex__(sdata->lastswaphash, sdata->lastswaphashbin, 32);
-        sdata->blockchange_id = wb->id;
-    }
-    mutex_unlock(&sdata->last_hash_lock);
-    if (*new_block && ckp->logshares) {
-        sprintf(wb->logdir, "%s%08x/", ckp->logdir, wb->height);
-        ret = mkdir(wb->logdir, 0750);
+
+    if (new_block && ckp->logshares) {
+        char logdir[512];
+        snprintf(logdir, sizeof(logdir), "%s%08x/", ckp->logdir, wb->height);
+        int ret = mkdir(logdir, 0750);
         if (unlikely(ret && errno != EEXIST))
-            LOGERR("Failed to create log directory %s", wb->logdir);
+            LOGERR("Failed to create log directory %s", logdir);
     }
-    sprintf(wb->idstring, "%016"PRIx64, wb->id);
-    if (ckp->logshares)
-        sprintf(wb->logdir, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
 
-    HASH_ADD_I64(sdata->workbases, id, wb);
-    if (sdata->current_workbase)
-        tv_time(&sdata->current_workbase->retired);
-    sdata->current_workbase = wb;
-
-    /* Is this long enough to ensure we don't dereference a workbase
-     * immediately? Should be unless clock changes 10 minutes so we use
-     * ts_realtime */
+    ck_wlock(&sdata->workbase_lock);
     HASH_ITER(hh, sdata->workbases, tmp, tmpa) {
         if (HASH_COUNT(sdata->workbases) < 3)
             break;
@@ -1677,12 +1691,11 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
             continue;
         if (tmp->readcount)
             continue;
-        /*  Age old workbases older than 10 minutes old */
+        /* Age old workbases older than 10 minutes old */
         if (tmp->gentime.tv_sec < wb->gentime.tv_sec - 600) {
             HASH_DEL(sdata->workbases, tmp);
             ck_wunlock(&sdata->workbase_lock);
 
-            /* Drop lock to avoid recursive locks */
             send_ageworkinfo(ckp, tmp->id);
             age_share_hashtable(sdata, tmp->id);
             clear_workbase(ckp, tmp);
@@ -1692,12 +1705,7 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
     }
     ck_wunlock(&sdata->workbase_lock);
 
-   /* This wb can't be pulled out from under us so no workbase lock is
-    * required to generate_userwbs */
-   if (ckp->solo)
-        generate_userwbs(sdata, wb);
-
-    if (*new_block)
+    if (new_block)
         purge_share_hashtable(sdata, wb->id);
 
     if (!ckp->passthrough)
@@ -2027,6 +2035,15 @@ static void confirm_block(sdata_t *sdata, json_t *blocksolve_val)
         user->accumulated = user->postponed = 0;
     }
 
+    postponed = json_object_get(blocksolve_val, "postponed");
+    if (unlikely(!postponed)) {
+        LOGERR("Failed to get postponed object in confirm_block");
+        return;
+    }
+    /* Nothing to distribute if no users were postponed (always true in SOLO mode) */
+    if (!json_object_size(postponed))
+        return;
+
     const bool res1 = json_get_double(&rolling_herp, blocksolve_val, "herp");
     const bool res2 = json_get_double(&dreward, blocksolve_val, "reward");
     if (unlikely(rolling_herp <= 0 || dreward <= 0 || !res1 || !res2)) {
@@ -2035,11 +2052,6 @@ static void confirm_block(sdata_t *sdata, json_t *blocksolve_val)
     }
     dreward *= SATOSHIS;
 
-    postponed = json_object_get(blocksolve_val, "postponed");
-    if (unlikely(!postponed)) {
-        LOGERR("Failed to get postponed object in confirm_block");
-        return;
-    }
     /* Add all postponed herp for each user to their accumulated */
     json_object_foreach(postponed, username, val) {
         double herp, derp;
@@ -2057,8 +2069,6 @@ static void confirm_block(sdata_t *sdata, json_t *blocksolve_val)
             user->postponed++;
         mutex_unlock(&user->stats_lock);
     }
-
-
 }
 
 /* Block was orphaned. In Variant C we do NOT re-add old shares to the pool round
@@ -2272,15 +2282,11 @@ static void get_lastswaphash_threadsafe(sdata_t *sdata, char outbuf[LastSwapHash
     outbuf[LastSwapHashSz - 1] = 0;
 }
 
-/* This function assumes it will only receive a valid json gbt base template
- * since checking should have been done earlier, and creates the base template
- * for generating work templates. This is a ckmsgq so all uses of this function
- * are serialised. */
 static void block_update(pool_t *ckp, int *prio)
 {
     json_t *txn_array;
     sdata_t *sdata = ckp->sdata;
-    bool new_block = false;
+    bool new_block = false, diff_changed = false;
     int retries = 0;
     bool ret = false;
     txntable_t *txns;
@@ -2312,16 +2318,15 @@ retry:
 
     txn_array = json_object_get(wb->json, "transactions");
 
-    /* This function will trim transactions and coinbasevalue to leave room
-     * for user generation transactions */
     txns = wb_merkle_bin_txns(ckp, sdata, wb, txn_array, true);
 
     generate_coinbase(ckp, wb);
 
-    add_base(ckp, sdata, wb, &new_block);
+    /* 1. Register workbase in RAM */
+    add_base(ckp, sdata, wb, &new_block, &diff_changed);
 
+    /* 2. IMMEDIATELY broadcast mining.notify to all connected miners before any disk/cleanup work */
     if (ckp->solo)
-        // SOLO mode: generate per-user workbases and broadcast
         stratum_broadcast_solo_updates(sdata, new_block);
     else
         stratum_broadcast_update(sdata, wb, new_block);
@@ -2329,21 +2334,19 @@ retry:
     ret = true;
     LOGINFO("Broadcast updated stratum base");
 
+    /* 3. Perform disk logging, share hashtable purge, and workinfo updates AFTER broadcast */
+    post_base_housekeeping(ckp, sdata, wb, new_block, diff_changed);
+
     if (new_block) {
         char lastswaphash[LastSwapHashSz];
         get_lastswaphash_threadsafe(sdata, lastswaphash);
         LOGNOTICE("Block hash changed to %s", lastswaphash);
-        /* Checking existence of DL list lockless but not trying to
-         * reference data */
         if (sdata->stats.unconfirmed)
             check_unconfirmed(ckp, sdata, wb->height);
     }
-    /* Update transactions after stratum broadcast to not delay
-     * propagation. */
     if (likely(txns))
         update_txns(ckp, sdata, txns, true);
-    /* Reset the update time to avoid stacked low priority notifies. Bring
-     * forward the next notify in case of a new block. */
+
     mutex_lock(&sdata->update_time_lock);
     sdata->update_time = time(NULL);
     if (new_block) {
@@ -2352,13 +2355,10 @@ retry:
     }
     mutex_unlock(&sdata->update_time_lock);
 out:
-
     LOGDEBUG("%s: took %1.6f secs", __func__, (time_micros() - t0)/1e6);
 
     cksem_post(&sdata->update_sem);
 
-    /* Send a ping to miners if we fail to get a base to keep them
-     * connected while bitcoind recovers(?) */
     if (unlikely(!ret)) {
         LOGINFO("Broadcast ping due to failed stratum base update");
         broadcast_ping(sdata);
@@ -2695,16 +2695,12 @@ static void add_node_base(pool_t *ckp, json_t *val, bool trusted, int64_t client
 {
     workbase_t *wb = ckzalloc(sizeof(workbase_t));
     sdata_t *sdata = ckp->sdata;
-    bool new_block = false;
+    bool new_block = false, diff_changed = false;
     char header[272];
 
     wb->ckp = ckp;
-    /* This is the client id if this workbase came from a remote trusted
-     * server. */
     wb->client_id = client_id;
 
-    /* Some of these fields are empty when running as a remote trusted
-     * server receiving other workinfos from the upstream pool */
     json_int64cpy(&wb->id, val, "jobid");
     json_strcpy(wb->target, val, "target");
     json_dblcpy(&wb->diff, val, "diff");
@@ -2722,7 +2718,6 @@ static void add_node_base(pool_t *ckp, json_t *val, bool trusted, int64_t client
     json_intcpy(&wb->txns, val, "txns");
     json_strdup(&wb->txn_hashes, val, "txn_hashes");
     if (!ckp->proxy) {
-        /* This is a workbase from a trusted remote */
         wb->merkle_array = json_object_dup(val, "merklehash");
         json_intcpy(&wb->merkles, val, "merkles");
         if (!rebuild_txns(ckp, sdata, wb))
@@ -2755,12 +2750,12 @@ static void add_node_base(pool_t *ckp, json_t *val, bool trusted, int64_t client
     LOGDEBUG("Header: %s", header);
     hex2bin(wb->headerbin, header, 112);
 
-    /* If this is from a remote trusted server or an upstream server, add
-     * it to the remote_workbases hashtable */
-    if (trusted)
+    if (trusted) {
         add_remote_base(ckp, sdata, wb);
-    else
-        add_base(ckp, sdata, wb, &new_block);
+    } else {
+        add_base(ckp, sdata, wb, &new_block, &diff_changed);
+        post_base_housekeeping(ckp, sdata, wb, new_block, diff_changed);
+    }
 
     if (new_block) {
         char lastswaphash[LastSwapHashSz];
@@ -3952,7 +3947,7 @@ static void check_userproxies(sdata_t *sdata, proxy_t *proxy, const int userid)
 static void update_notify(pool_t *ckp, const char *cmd)
 {
     sdata_t *sdata = ckp->sdata, *dsdata;
-    bool new_block = false, clean;
+    bool new_block = false, diff_changed = false, clean;
     int i, id = 0, subid = 0;
     char header[272];
     const char *buf;
@@ -4036,7 +4031,13 @@ static void update_notify(pool_t *ckp, const char *cmd)
     wb->diff = proxy->diff;
     ck_runlock(&dsdata->workbase_lock);
 
-    add_base(ckp, dsdata, wb, &new_block);
+    add_base(ckp, dsdata, wb, &new_block, &diff_changed);
+    clean |= new_block;
+    LOGINFO("Proxy %d:%d broadcast updated stratum notify with%s clean", id,
+        subid, clean ? "" : "out");
+    stratum_broadcast_update(dsdata, wb, clean);
+    post_base_housekeeping(ckp, dsdata, wb, new_block, diff_changed);
+
     if (new_block) {
         char lastswaphash[LastSwapHashSz];
         get_lastswaphash_threadsafe(dsdata, lastswaphash);
@@ -4047,10 +4048,6 @@ static void update_notify(pool_t *ckp, const char *cmd)
     }
 
     check_proxy(sdata, proxy);
-    clean |= new_block;
-    LOGINFO("Proxy %d:%d broadcast updated stratum notify with%s clean", id,
-        subid, clean ? "" : "out");
-    stratum_broadcast_update(dsdata, wb, clean);
 out:
     json_decref(val);
 }
@@ -4495,8 +4492,13 @@ static void stratum_broadcast(sdata_t *sdata, json_t *val, const int msg_type)
 
     json_decref(val);
 
-    if (likely(bulk_send))
-        ssend_bulk_append(sdata, bulk_send, messages);
+    if (likely(bulk_send)) {
+        /* Prepend job updates to the very front of the send queue */
+        if (msg_type == SM_UPDATE)
+            ssend_bulk_prepend(sdata, bulk_send, messages);
+        else
+            ssend_bulk_append(sdata, bulk_send, messages);
+    }
 }
 
 static void stratum_add_send(sdata_t *sdata, json_t *val, const int64_t client_id,
@@ -6160,7 +6162,7 @@ static void *zmqnotify(void *arg)
                 if ( ( (last_seen_zmq_block && labs(last_newblock - last_seen_zmq_block) > one_minute)
                        || (!last_seen_zmq_block && labs(time(NULL) - last_newblock) > 20 * one_minute))
                      && labs(time(NULL) - last_reset) > 2 * one_minute ) {
-                    LOGWARNING("ZMQ: zmq socket(s) idle, recreating them to enure they are still valid");
+                    LOGWARNING("ZMQ: zmq socket(s) idle, recreating them to ensure they are still valid");
                     reset_sockets = true;
                     ++failure_ct;
                 } else {
@@ -7170,13 +7172,19 @@ static void parse_password_diff(const char *pass, int64_t *req_mindiff, int64_t 
         if (!strncasecmp(token, "md=", 3)) {
             char *endptr = NULL;
             double val = strtod(token + 3, &endptr);
-            if (val > 0.0)
+            if (isfinite(val) && val > 0.0) {
+                if (val > 1e18)
+                    val = 1e18;
                 *req_fixeddiff = (int64_t)MAX(1LL, llround(val));
+            }
         } else if (!strncasecmp(token, "d=", 2)) {
             char *endptr = NULL;
             double val = strtod(token + 2, &endptr);
-            if (val > 0.0)
+            if (isfinite(val) && val > 0.0) {
+                if (val > 1e18)
+                    val = 1e18;
                 *req_mindiff = (int64_t)MAX(1LL, llround(val));
+            }
         }
         token = strtok_r(NULL, ",; \t", &saveptr);
     }
@@ -8313,31 +8321,37 @@ static json_t *user_solo_notify__(const workbase_t *wb, const user_instance_t *u
     return val;
 }
 
-/* Sends a stratum update with a unique coinb2 for every client. Avoid
- * recursive locking. */
+/* Sends a stratum update with a unique coinb2 for every client at top priority */
 static void stratum_broadcast_solo_updates(sdata_t *sdata, bool clean)
 {
     stratum_instance_t *client, *tmp;
-    json_t *json_msg;
+    ckmsg_t *bulk_send = NULL;
+    int messages = 0;
 
-    ck_wlock(&sdata->instance_lock);
+    ck_rlock(&sdata->instance_lock);
+    ck_rlock(&sdata->workbase_lock);
     HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
-        if (!client->user_instance)
+        if (!client->user_instance || !client_active(client) || remote_server(client))
             continue;
-        inc_instance_ref__(client);
-        ck_wunlock(&sdata->instance_lock);
 
-        ck_rlock(&sdata->workbase_lock);
-        json_msg = user_solo_notify__(sdata->current_workbase, client->user_instance, clean);
-        ck_runlock(&sdata->workbase_lock);
-
-        if (likely(json_msg))
-            stratum_add_send(sdata, json_msg, client->id, SM_UPDATE);
-
-        ck_wlock(&sdata->instance_lock);
-        dec_instance_ref__(client);
+        json_t *json_msg = user_solo_notify__(sdata->current_workbase, client->user_instance, clean);
+        if (likely(json_msg)) {
+            if (subclient(client->id))
+                json_set_string(json_msg, "node.method", stratum_msgs[SM_UPDATE]);
+            ckmsg_t *client_msg = ckalloc(sizeof(ckmsg_t));
+            smsg_t *msg = ckzalloc(sizeof(smsg_t));
+            msg->json_msg = json_msg;
+            msg->client_id = client->id;
+            client_msg->data = msg;
+            DL_APPEND(bulk_send, client_msg);
+            messages++;
+        }
     }
-    ck_wunlock(&sdata->instance_lock);
+    ck_runlock(&sdata->workbase_lock);
+    ck_runlock(&sdata->instance_lock);
+
+    if (likely(bulk_send))
+        ssend_bulk_prepend(sdata, bulk_send, messages);
 }
 
 static void send_json_err(sdata_t *sdata, const int64_t client_id, json_t *id_val, const char *err_msg)
@@ -10211,10 +10225,17 @@ static void update_pool_blocks_file(pool_t *ckp, sdata_t *sdata, const pool_stat
         o_ratio = ((double)orphaned_count * 100.0) / (double)blocks_solved;
     snprintf(orphan_ratio_str, sizeof(orphan_ratio_str), "%.4f", o_ratio);
 
-    /* 2. Hashrate 15m and difficulty */
-    uint64_t pool_hs_15m = (uint64_t)llround(stats_copy->dsps15 * nonces);
+    /* 2. Hashrate 15m and difficulty (clamped to prevent llround SIGFPE) */
+    double pool_hs_15m_d = stats_copy->dsps15 * nonces;
+    uint64_t pool_hs_15m = 0;
+    if (isfinite(pool_hs_15m_d) && pool_hs_15m_d > 0.0) {
+        if (pool_hs_15m_d >= 9e18)
+            pool_hs_15m = 9000000000000000000ULL;
+        else
+            pool_hs_15m = (uint64_t)llround(pool_hs_15m_d);
+    }
     char pool_hr_suffix[16];
-    suffix_string(stats_copy->dsps15 * nonces, pool_hr_suffix, 16, 0);
+    suffix_string(pool_hs_15m_d, pool_hr_suffix, 16, 0);
 
     double net_diff = 0.0;
     ck_rlock(&sdata->workbase_lock);
@@ -10224,10 +10245,16 @@ static void update_pool_blocks_file(pool_t *ckp, sdata_t *sdata, const pool_stat
     if (net_diff <= 0.0)
         net_diff = (double)stats_copy->network_diff;
 
-    /* 3. Time to block */
+    /* 3. Time to block (clamped below INT64_MAX to prevent SIGFPE in llround on low hashrate) */
     uint64_t ttb_unix = 0;
-    if (pool_hs_15m > 0 && net_diff > 0.0)
-        ttb_unix = (uint64_t)llround((net_diff * nonces) / (double)pool_hs_15m);
+    if (pool_hs_15m > 0 && net_diff > 0.0) {
+        static const double MAX_TTB_SEC = 3153600000000000.0; /* ~100 million years */
+        double ttb_d = (net_diff * nonces) / (double)pool_hs_15m;
+        if (!isfinite(ttb_d) || ttb_d >= MAX_TTB_SEC)
+            ttb_unix = (uint64_t)MAX_TTB_SEC;
+        else if (ttb_d > 0.0)
+            ttb_unix = (uint64_t)llround(ttb_d);
+    }
 
     char ttb_human[64];
     format_timetoblock(ttb_unix, ttb_human, sizeof(ttb_human));
@@ -10931,7 +10958,9 @@ static void *statsupdate(void *arg)
                 upstream_workers(ckp, user);
         }
 
-        calc_user_paygens(sdata);
+        /* Skip O(N log N) payout list generation in SOLO mode */
+        if (!ckp->solo)
+            calc_user_paygens(sdata);
 
         LOGINFO("Estimated %d bytes will be needed in coinbase for user payouts", cbspace);
 
@@ -10969,13 +10998,21 @@ static void *statsupdate(void *arg)
             read_unconfirmed_blocks(ckp, sdata);
         }
 
-        hashrate_to_str2(stats_copy->dsps1 * nonces, suffix1, sizeof(suffix1));
-        hashrate_to_str2(stats_copy->dsps5 * nonces, suffix5, sizeof(suffix5));
-        hashrate_to_str2(stats_copy->dsps15 * nonces, suffix15, sizeof(suffix15));
-        hashrate_to_str2(stats_copy->dsps60 * nonces, suffix60, sizeof(suffix60));
-        hashrate_to_str2(stats_copy->dsps360 * nonces, suffix360, sizeof(suffix360));
-        hashrate_to_str2(stats_copy->dsps1440 * nonces, suffix1440, sizeof(suffix1440));
-        hashrate_to_str2(stats_copy->dsps10080 * nonces, suffix10080, sizeof(suffix10080));
+        ghs1 = stats_copy->dsps1 * nonces;
+        ghs5 = stats_copy->dsps5 * nonces;
+        ghs15 = stats_copy->dsps15 * nonces;
+        ghs60 = stats_copy->dsps60 * nonces;
+        ghs360 = stats_copy->dsps360 * nonces;
+        ghs1440 = stats_copy->dsps1440 * nonces;
+        ghs10080 = stats_copy->dsps10080 * nonces;
+
+        hashrate_to_str2(ghs1, suffix1, sizeof(suffix1));
+        hashrate_to_str2(ghs5, suffix5, sizeof(suffix5));
+        hashrate_to_str2(ghs15, suffix15, sizeof(suffix15));
+        hashrate_to_str2(ghs60, suffix60, sizeof(suffix60));
+        hashrate_to_str2(ghs360, suffix360, sizeof(suffix360));
+        hashrate_to_str2(ghs1440, suffix1440, sizeof(suffix1440));
+        hashrate_to_str2(ghs10080, suffix10080, sizeof(suffix10080));
 
         ASPRINTF(&fname, "%s/pool/pool.status", ckp->logdir);
         fp = fopen(fname, "we");
@@ -11458,13 +11495,13 @@ void *stratifier(void *arg)
     read_poolstats(ckp, &tvsec_diff);
     read_userstats(ckp, sdata, tvsec_diff);
     read_unconfirmed_blocks(ckp, sdata); /* Restore unconfirmed blocks from the disk */
-    
+
     /* Create the logs/history/ folder structure when starting the pool. */
     ensure_history_dirs(ckp->logdir);
 
-    /* Calculate base user paygens for the first workbase to have something
-     * to work with. */
-    calc_user_paygens(sdata);
+    /* Calculate base user paygens for the first workbase (unused in SOLO mode) */
+    if (!ckp->solo)
+        calc_user_paygens(sdata);
 
     /* Set HERP window to impossibly large until we know the network diff */
     sdata->stats.herp_window = ~0ULL;
